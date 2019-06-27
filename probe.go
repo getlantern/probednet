@@ -3,7 +3,11 @@
 // circumvention tool.
 package probe
 
-import "net"
+import (
+	"net"
+
+	"github.com/getlantern/errors"
+)
 
 // Probes on a network connection.
 type Probes struct {
@@ -17,6 +21,25 @@ type Probes struct {
 //
 // Currently supported networks are "tcp4" and "tcp6".
 func Dial(network, address string, probes Probes) (net.Conn, error) {
-	// TODO: implement me!
-	return nil, nil
+	switch network {
+	case "tcp4", "tcp6":
+	default:
+		return nil, errors.New("unsupported network")
+	}
+
+	conn, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	closeConn := true
+	defer func() {
+		if closeConn {
+			conn.Close()
+		}
+	}()
+
+	// TODO: use pcap to add probes to connection
+
+	closeConn = false
+	return conn, nil
 }
