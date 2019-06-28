@@ -9,5 +9,6 @@ require (
 	github.com/getlantern/hidden v0.0.0-20190325191715-f02dbb02be55 // indirect
 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
-	github.com/stretchr/testify v1.3.0 // indirect
+	github.com/google/gopacket v1.1.17
+	github.com/stretchr/testify v1.3.0
 )
