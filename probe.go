@@ -8,7 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket/pcap"
@@ -19,33 +19,78 @@ import (
 const (
 	// Warning: do not set to >= 1 second: https://github.com/google/gopacket/issues/499
 	packetReadTimeout = 500 * time.Millisecond
+
+	channelBufferSize = 1000
 )
 
-// Probes on a network connection.
+// Packet represents a network packet.
+type Packet struct {
+	Data []byte
+
+	// Timestamp is the time the packet was captured, if that is known.
+	Timestamp time.Time
+}
+
+// Probes on a network connection. All channels are buffered and if these buffers fill, data will be
+// lost.
 type Probes struct {
-	// In receives all inbound packets and Out receives all outbound packets.
-	In, Out func(pkt []byte)
+	// Inbound and Outbound packets. Packets on these channels will be link-layer packets. The
+	// specific type depends on the network interface used for the connection. Usually, these will
+	// be ethernet frames. For connections through the loopback interface, these will be loopback
+	// packets and the exact structure depends on your operating system.
+	Inbound, Outbound <-chan Packet
 
-	done     chan struct{}
-	initDone sync.Once
+	Errors <-chan error
+
+	DroppedPackets, DroppedErrors int32
+
+	// Same instances of the above channels, but bi-directional.
+	inbound, outbound chan Packet
+	errors            chan error
+
+	done chan struct{}
 }
 
-func (p *Probes) doneChannel() chan struct{} {
-	p.initDone.Do(func() { p.done = make(chan struct{}) })
-	return p.done
-}
-
-// Close the probes.
-func (p *Probes) Close() error {
-	doneChan := p.doneChannel()
-	select {
-	case _, ok := <-doneChan:
-		if ok {
-			close(doneChan)
-		}
-	default:
-		close(doneChan)
+func startProbes(in, out *pcap.Handle) *Probes {
+	p := Probes{
+		inbound:  make(chan Packet, channelBufferSize),
+		outbound: make(chan Packet, channelBufferSize),
+		errors:   make(chan error, channelBufferSize),
+		done:     make(chan struct{}),
 	}
+	p.Inbound, p.Outbound, p.Errors = p.inbound, p.outbound, p.errors
+	go p.read(in, p.inbound)
+	go p.read(out, p.outbound)
+	return &p
+}
+
+func (p *Probes) read(handle *pcap.Handle, packets chan<- Packet) {
+	for {
+		select {
+		case <-p.done:
+			return
+		default:
+			pkt, captureInfo, err := handle.ReadPacketData()
+			if err != nil {
+				select {
+				case p.errors <- err:
+				default:
+					atomic.AddInt32(&p.DroppedErrors, 1)
+				}
+				continue
+			}
+			select {
+			case packets <- Packet{pkt, captureInfo.Timestamp}:
+			default:
+				atomic.AddInt32(&p.DroppedPackets, 1)
+			}
+		}
+	}
+}
+
+// Close the probes. This can be done before or after closing the associated connection.
+func (p *Probes) Close() error {
+	close(p.done)
 	return nil
 }
 
@@ -54,18 +99,18 @@ func (p *Probes) Close() error {
 // in the probes receiving TCP packets.
 //
 // Currently supported networks are "tcp4" and "tcp6".
-func Dial(network, address string, probes *Probes) (net.Conn, error) {
+func Dial(network, address string) (net.Conn, *Probes, error) {
 	// TODO: capture beginning of connection (e.g. SYN, SYN/ACK, etc.)
 
 	switch network {
 	case "tcp4", "tcp6":
 	default:
-		return nil, errors.New("unsupported network")
+		return nil, nil, errors.New("unsupported network")
 	}
 
 	conn, err := net.Dial(network, address)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	closeConn := true
 	defer func() {
@@ -82,40 +127,38 @@ func Dial(network, address string, probes *Probes) (net.Conn, error) {
 	case "tcp4", "tcp6":
 		lAddrTCP, err := net.ResolveTCPAddr(network, conn.LocalAddr().String())
 		if err != nil {
-			return nil, errors.New("failed to obtain local IP for connection: %v", err)
+			return nil, nil, errors.New("failed to obtain local IP for connection: %v", err)
 		}
 		lIP = lAddrTCP.IP
 		bpfIn = fmt.Sprintf("ip dst %v and tcp dst port %d", lAddrTCP.IP, lAddrTCP.Port)
 		bpfOut = fmt.Sprintf("ip src %v and tcp src port %d", lAddrTCP.IP, lAddrTCP.Port)
 	default:
-		return nil, errors.New("unsupported network")
+		return nil, nil, errors.New("unsupported network")
 	}
 
 	iface, err := getInterface(lIP)
 	if err != nil {
-		return nil, errors.New("failed to obtain interface for connection's local address: %v", err)
+		return nil, nil, errors.New("failed to obtain interface for connection's local address: %v", err)
 	}
 
 	handleIn, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
 	if err != nil {
-		return nil, errors.New("failed to open pcap handle: %v", err)
+		return nil, nil, errors.New("failed to open pcap handle: %v", err)
 	}
 	if err := handleIn.SetBPFFilter(bpfIn); err != nil {
-		return nil, errors.New("failed to configure capture filter: %v", err)
+		return nil, nil, errors.New("failed to configure capture filter: %v", err)
 	}
 	handleOut, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
 	if err != nil {
-		return nil, errors.New("failed to open pcap handle: %v", err)
+		return nil, nil, errors.New("failed to open pcap handle: %v", err)
 	}
 	if err := handleOut.SetBPFFilter(bpfOut); err != nil {
-		return nil, errors.New("failed to configure capture filter: %v", err)
+		return nil, nil, errors.New("failed to configure capture filter: %v", err)
 	}
 
-	go readPackets(handleIn, probes.In, probes.doneChannel())
-	go readPackets(handleOut, probes.Out, probes.doneChannel())
-
+	probes := startProbes(handleIn, handleOut)
 	closeConn = false
-	return conn, nil
+	return conn, probes, nil
 }
 
 func getInterface(ip net.IP) (*net.Interface, error) {
@@ -176,22 +219,4 @@ func parseNetwork(addr string) (*net.IPNet, error) {
 		mask = net.CIDRMask(maskOnes, 128)
 	}
 	return &net.IPNet{IP: ip, Mask: mask}, nil
-}
-
-func readPackets(handle *pcap.Handle, f func([]byte), done chan struct{}) {
-	for {
-		select {
-		case <-done:
-			return
-		default:
-			rawPkt, _, err := handle.ReadPacketData()
-			if err != nil {
-				// TODO: handle errors
-				// debugging
-				fmt.Println("failed to read packet data:", err)
-				continue
-			}
-			f(rawPkt)
-		}
-	}
 }

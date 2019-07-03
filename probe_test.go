@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,43 +14,6 @@ import (
 
 	"github.com/getlantern/errors"
 )
-
-func isClosed(c chan struct{}) bool {
-	select {
-	case v, open := <-c:
-		if open {
-			c <- v
-		}
-		return !open
-	default:
-		return false
-	}
-}
-
-func TestProbesClose(t *testing.T) {
-	doTest := func(valueOnChannel bool) func(t *testing.T) {
-		return func(t *testing.T) {
-			t.Parallel()
-			p := Probes{}
-			c := p.doneChannel()
-			if valueOnChannel {
-				// Make done a buffered channel so we can write without blocking.
-				p.done = make(chan struct{}, 1)
-				c = p.doneChannel()
-				c <- struct{}{}
-			}
-
-			assert.False(t, isClosed(c))
-			assert.NoError(t, p.Close())
-			assert.True(t, isClosed(c))
-			assert.NotPanics(t, func() { assert.NoError(t, p.Close()) })
-		}
-	}
-
-	t.Parallel()
-	t.Run("empty channel", doTest(false))
-	t.Run("value on channel", doTest(true))
-}
 
 type testServer struct {
 	net.Listener
@@ -146,8 +108,6 @@ func (s uint32Set) keys() []uint32 {
 }
 
 func TestDial(t *testing.T) {
-	// TODO: actually look at TCP packets and do some sanity checks
-
 	t.Parallel()
 
 	const (
@@ -173,23 +133,31 @@ func TestDial(t *testing.T) {
 	}()
 	go s.serve([]byte(serverMsg), serverErrors)
 
-	inboundPackets, outboundPackets := [][]byte{}, [][]byte{}
-	inboundLock, outboundLock := new(sync.Mutex), new(sync.Mutex)
-	probes := Probes{
-		In: func(pkt []byte) {
-			inboundLock.Lock()
-			inboundPackets = append(inboundPackets, pkt)
-			inboundLock.Unlock()
-		},
-		Out: func(pkt []byte) {
-			outboundLock.Lock()
-			outboundPackets = append(outboundPackets, pkt)
-			outboundLock.Unlock()
-		},
-	}
-	conn, err := Dial("tcp4", s.Addr().String(), &probes)
+	conn, probes, err := Dial("tcp4", s.Addr().String())
 	require.NoError(t, err)
 	defer conn.Close()
+
+	inboundPackets, outboundPackets := [][]byte{}, [][]byte{}
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case pkt := <-probes.Inbound:
+				inboundPackets = append(inboundPackets, pkt.Data)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case pkt := <-probes.Outbound:
+				outboundPackets = append(outboundPackets, pkt.Data)
+			}
+		}
+	}()
 
 	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(timeout)))
 	_, err = conn.Write([]byte(clientMsg))
@@ -211,13 +179,12 @@ func TestDial(t *testing.T) {
 	// Wait for remaining packets to come through, then check whether we saw the packets we expected
 	// to on the probes.
 	time.Sleep(time.Second)
+	probes.Close()
 
 	var (
 		inboundDecoded, outboundDecoded = []tcp4Packet{}, []tcp4Packet{}
 		inboundACKs, outboundACKs       = uint32Set{}, uint32Set{}
 	)
-	inboundLock.Lock()
-	outboundLock.Lock()
 	for _, pkt := range inboundPackets {
 		decoded, err := decodeTCP4(pkt)
 		require.NoError(t, err)
@@ -230,8 +197,6 @@ func TestDial(t *testing.T) {
 		outboundDecoded = append(outboundDecoded, *decoded)
 		outboundACKs.add(decoded.tcpLayer.Ack)
 	}
-	inboundLock.Unlock()
-	outboundLock.Unlock()
 
 	sawClientMsg, sawServerMsg := false, false
 	for _, pkt := range inboundDecoded {
