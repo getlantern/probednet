@@ -133,7 +133,7 @@ func TestDial(t *testing.T) {
 	}()
 	go s.serve([]byte(serverMsg), serverErrors)
 
-	conn, probes, err := Dial("tcp4", s.Addr().String())
+	conn, probes, err := Dial("tcp", s.Addr().String())
 	require.NoError(t, err)
 	defer conn.Close()
 

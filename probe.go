@@ -98,12 +98,12 @@ func (p *Probes) Close() error {
 // and output packets at the layer specified by network. For example, Dial("tcp", addr) will result
 // in the probes receiving TCP packets.
 //
-// Currently supported networks are "tcp4" and "tcp6".
+// Currently supported networks are "tcp", "tcp4", and "tcp6".
 func Dial(network, address string) (net.Conn, *Probes, error) {
 	// TODO: capture beginning of connection (e.g. SYN, SYN/ACK, etc.)
 
 	switch network {
-	case "tcp4", "tcp6":
+	case "tcp", "tcp4", "tcp6":
 	default:
 		return nil, nil, errors.New("unsupported network")
 	}
@@ -119,22 +119,13 @@ func Dial(network, address string) (net.Conn, *Probes, error) {
 		}
 	}()
 
-	var (
-		lIP           net.IP
-		bpfIn, bpfOut string
-	)
-	switch network {
-	case "tcp4", "tcp6":
-		lAddrTCP, err := net.ResolveTCPAddr(network, conn.LocalAddr().String())
-		if err != nil {
-			return nil, nil, errors.New("failed to obtain local IP for connection: %v", err)
-		}
-		lIP = lAddrTCP.IP
-		bpfIn = fmt.Sprintf("ip dst %v and tcp dst port %d", lAddrTCP.IP, lAddrTCP.Port)
-		bpfOut = fmt.Sprintf("ip src %v and tcp src port %d", lAddrTCP.IP, lAddrTCP.Port)
-	default:
-		return nil, nil, errors.New("unsupported network")
+	lAddrTCP, err := net.ResolveTCPAddr(network, conn.LocalAddr().String())
+	if err != nil {
+		return nil, nil, errors.New("failed to obtain local IP for connection: %v", err)
 	}
+	lIP := lAddrTCP.IP
+	bpfIn := fmt.Sprintf("ip dst %v and tcp dst port %d", lAddrTCP.IP, lAddrTCP.Port)
+	bpfOut := fmt.Sprintf("ip src %v and tcp src port %d", lAddrTCP.IP, lAddrTCP.Port)
 
 	iface, err := getInterface(lIP)
 	if err != nil {
