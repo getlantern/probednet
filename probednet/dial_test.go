@@ -1,4 +1,4 @@
-package probe
+package probednet
 
 import (
 	"bytes"
@@ -94,6 +94,21 @@ func decodeTCP4(linkPacket []byte) (*tcp4Packet, error) {
 	return &decoded, nil
 }
 
+func (p tcp4Packet) expectedACK() uint32 {
+	if p.tcpLayer.SYN {
+		return p.tcpLayer.Seq + 1
+	}
+	return p.tcpLayer.Seq + uint32(len(p.payload))
+}
+
+func freeTCPAddrLoopback(t *testing.T, network string) *net.TCPAddr {
+	t.Helper()
+	l, err := net.ListenTCP(network, nil)
+	require.NoError(t, err)
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr)
+}
+
 type uint32Set map[uint32]bool
 
 func (s uint32Set) add(i uint32)           { s[i] = true }
@@ -107,8 +122,32 @@ func (s uint32Set) keys() []uint32 {
 	return l
 }
 
-func TestDial(t *testing.T) {
+func TestDialTCP(t *testing.T) {
 	t.Parallel()
+
+	localhost0 := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
+
+	t.Run("nil address", func(t *testing.T) {
+		t.Parallel()
+		testDialTCPHelper(t, "tcp4", func() *net.TCPAddr { return nil })
+	})
+	t.Run("wildcard port", func(t *testing.T) {
+		t.Parallel()
+		testDialTCPHelper(t, "tcp4", func() *net.TCPAddr { return &localhost0 })
+	})
+	t.Run("set port", func(t *testing.T) {
+		t.Parallel()
+		testDialTCPHelper(t, "tcp4", func() *net.TCPAddr {
+			l, err := net.ListenTCP("tcp4", &localhost0)
+			require.NoError(t, err)
+			defer l.Close()
+			return l.Addr().(*net.TCPAddr)
+		})
+	})
+}
+
+func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAddr) {
+	t.Helper()
 
 	const (
 		timeout              = time.Second
@@ -118,7 +157,7 @@ func TestDial(t *testing.T) {
 	done := make(chan struct{})
 	defer close(done)
 
-	s, err := newTestServer("tcp4", "127.0.0.1:0")
+	s, err := newTestServer(network, "localhost:0")
 	require.NoError(t, err)
 	defer s.Close()
 
@@ -133,7 +172,7 @@ func TestDial(t *testing.T) {
 	}()
 	go s.serve([]byte(serverMsg), serverErrors)
 
-	conn, probes, err := Dial("tcp", s.Addr().String())
+	conn, probes, err := DialTCP(network, laddrFunc(), s.Addr().(*net.TCPAddr))
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -201,17 +240,15 @@ func TestDial(t *testing.T) {
 	sawClientMsg, sawServerMsg := false, false
 	for _, pkt := range inboundDecoded {
 		sawServerMsg = sawServerMsg || bytes.Equal(pkt.payload, []byte(serverMsg))
-		expectedACK := pkt.tcpLayer.Seq + uint32(len(pkt.tcpLayer.Payload))
 		assert.True(
-			t, outboundACKs.contains(expectedACK),
-			"expected to see ACK %d from client; actually seen: %v", expectedACK, outboundACKs.keys())
+			t, outboundACKs.contains(pkt.expectedACK()),
+			"expected to see ACK %d from client; actually seen: %v", pkt.expectedACK(), outboundACKs.keys())
 	}
 	for _, pkt := range outboundDecoded {
 		sawClientMsg = sawClientMsg || bytes.Equal(pkt.payload, []byte(clientMsg))
-		expectedACK := pkt.tcpLayer.Seq + uint32(len(pkt.tcpLayer.Payload))
 		assert.True(
-			t, inboundACKs.contains(expectedACK),
-			"expected to see ACK %d from server; actually seen: %v", expectedACK, inboundACKs.keys())
+			t, inboundACKs.contains(pkt.expectedACK()),
+			"expected to see ACK %d from server; actually seen: %v", pkt.expectedACK(), inboundACKs.keys())
 	}
 	assert.True(t, sawClientMsg)
 	assert.True(t, sawServerMsg)

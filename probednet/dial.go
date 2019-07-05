@@ -1,7 +1,5 @@
-// Package probe offers utilities for actively probing proxies. The general idea is to probe Lantern
-// proxies as a censor would, looking for anything which might identify the server as a
-// circumvention tool.
-package probe
+// Package probednet offers utilities for probing constructions of the net package.
+package probednet
 
 import (
 	"fmt"
@@ -30,6 +28,8 @@ type Packet struct {
 	// Timestamp is the time the packet was captured, if that is known.
 	Timestamp time.Time
 }
+
+// TODO: combine Probes.Inbound and Probes.Outbound
 
 // Probes on a network connection. All channels are buffered and if these buffers fill, data will be
 // lost.
@@ -94,43 +94,42 @@ func (p *Probes) Close() error {
 	return nil
 }
 
-// Dial behaves like net.Dial, but attaches probes to the connection. These probes receieve input
-// and output packets at the layer specified by network. For example, Dial("tcp", addr) will result
-// in the probes receiving TCP packets.
+// Dial behaves like net.Dial, but attaches probes to the connection.
 //
 // Currently supported networks are "tcp", "tcp4", and "tcp6".
 func Dial(network, address string) (net.Conn, *Probes, error) {
-	// TODO: capture beginning of connection (e.g. SYN, SYN/ACK, etc.)
-
 	switch network {
 	case "tcp", "tcp4", "tcp6":
+		raddr, err := net.ResolveTCPAddr(network, address)
+		if err != nil {
+			return nil, nil, errors.New("failed to resolve address: %v", err)
+		}
+		return DialTCP(network, nil, raddr)
 	default:
 		return nil, nil, errors.New("unsupported network")
 	}
+}
 
-	conn, err := net.Dial(network, address)
+// DialTCP behaves like net.DialTCP, but attaches probes to the connection.
+//
+// Currently supported networks are "tcp", "tcp4", and "tcp6".
+func DialTCP(network string, laddr, raddr *net.TCPAddr) (*net.TCPConn, *Probes, error) {
+	// TODO: test IPv6
+
+	laddr, freeLaddr, err := chooseLaddr(network, laddr, raddr)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.New("failed to set local address: %v", err)
 	}
-	closeConn := true
-	defer func() {
-		if closeConn {
-			conn.Close()
-		}
-	}()
 
-	lAddrTCP, err := net.ResolveTCPAddr(network, conn.LocalAddr().String())
-	if err != nil {
-		return nil, nil, errors.New("failed to obtain local IP for connection: %v", err)
-	}
-	lIP := lAddrTCP.IP
-	bpfIn := fmt.Sprintf("ip dst %v and tcp dst port %d", lAddrTCP.IP, lAddrTCP.Port)
-	bpfOut := fmt.Sprintf("ip src %v and tcp src port %d", lAddrTCP.IP, lAddrTCP.Port)
+	bpfIn := fmt.Sprintf("ip dst %v and tcp dst port %d", laddr.IP, laddr.Port)
+	bpfOut := fmt.Sprintf("ip src %v and tcp src port %d", laddr.IP, laddr.Port)
 
-	iface, err := getInterface(lIP)
+	iface, err := getInterface(laddr.IP)
 	if err != nil {
 		return nil, nil, errors.New("failed to obtain interface for connection's local address: %v", err)
 	}
+
+	// TODO: handles need to be closed
 
 	handleIn, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
 	if err != nil {
@@ -148,8 +147,47 @@ func Dial(network, address string) (net.Conn, *Probes, error) {
 	}
 
 	probes := startProbes(handleIn, handleOut)
-	closeConn = false
+	if err := freeLaddr(); err != nil {
+		probes.Close()
+		return nil, nil, errors.New("unable to free local address for use: %v", err)
+	}
+	conn, err := net.DialTCP(network, laddr, raddr)
+	if err != nil {
+		probes.Close()
+		return nil, nil, err
+	}
 	return conn, probes, nil
+}
+
+// Chooses a local address based on the network and remote address. Any fields set on the input
+// local address will be honored. Returns the selected local address and a function to free the
+// port. The free function should be called immediately before using the address.
+func chooseLaddr(network string, laddr, raddr *net.TCPAddr) (*net.TCPAddr, func() error, error) {
+	if laddr == nil {
+		outboundIP, err := preferredOutboundIP(raddr.IP)
+		if err != nil {
+			return nil, nil, errors.New("no route to remote: %v", err)
+		}
+		laddr = &net.TCPAddr{IP: outboundIP}
+	}
+	if laddr.Port == 0 {
+		l, err := net.ListenTCP(network, laddr)
+		if err != nil {
+			return nil, nil, errors.New("failed to find free port: %v", err)
+		}
+		return l.Addr().(*net.TCPAddr), l.Close, nil
+	}
+	return laddr, func() error { return nil }, nil
+}
+
+func preferredOutboundIP(remoteIP net.IP) (net.IP, error) {
+	// Note: the choice of port below does not actually matter. It just needs to be non-zero.
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: remoteIP, Port: 80})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP, nil
 }
 
 func getInterface(ip net.IP) (*net.Interface, error) {
