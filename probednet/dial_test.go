@@ -101,12 +101,21 @@ func (p tcp4Packet) expectedACK() uint32 {
 	return p.tcpLayer.Seq + uint32(len(p.payload))
 }
 
-func freeTCPAddrLoopback(t *testing.T, network string) *net.TCPAddr {
-	t.Helper()
-	l, err := net.ListenTCP(network, nil)
-	require.NoError(t, err)
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr)
+// True iff this is a packet routed between conn.LocalAddr() and conn.RemoteAddr().
+func (p tcp4Packet) partOf(conn *net.TCPConn) bool {
+	correctSrcAndDst := func(src, dst *net.TCPAddr) bool {
+		return bytes.Equal(p.ipLayer.SrcIP, src.IP) &&
+			bytes.Equal(p.ipLayer.DstIP, dst.IP) &&
+			int(p.tcpLayer.SrcPort) == src.Port &&
+			int(p.tcpLayer.DstPort) == dst.Port
+	}
+	laddr, raddr := conn.LocalAddr().(*net.TCPAddr), conn.RemoteAddr().(*net.TCPAddr)
+	return correctSrcAndDst(laddr, raddr) || correctSrcAndDst(raddr, laddr)
+}
+
+func (p tcp4Packet) destinedFor(addr net.Addr) bool {
+	tcpAddr := addr.(*net.TCPAddr)
+	return bytes.Equal(p.ipLayer.DstIP, tcpAddr.IP) && int(p.tcpLayer.DstPort) == tcpAddr.Port
 }
 
 type uint32Set map[uint32]bool
@@ -176,24 +185,14 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 	require.NoError(t, err)
 	defer conn.Close()
 
-	inboundPackets, outboundPackets := [][]byte{}, [][]byte{}
+	packets := [][]byte{}
 	go func() {
 		for {
 			select {
 			case <-done:
 				return
-			case pkt := <-probes.Inbound:
-				inboundPackets = append(inboundPackets, pkt.Data)
-			}
-		}
-	}()
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case pkt := <-probes.Outbound:
-				outboundPackets = append(outboundPackets, pkt.Data)
+			case pkt := <-probes.Packets:
+				packets = append(packets, pkt.Data)
 			}
 		}
 	}()
@@ -221,34 +220,35 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 	probes.Close()
 
 	var (
-		inboundDecoded, outboundDecoded = []tcp4Packet{}, []tcp4Packet{}
-		inboundACKs, outboundACKs       = uint32Set{}, uint32Set{}
+		decodedPackets            = []tcp4Packet{}
+		inboundACKs, outboundACKs = uint32Set{}, uint32Set{}
 	)
-	for _, pkt := range inboundPackets {
+	for _, pkt := range packets {
 		decoded, err := decodeTCP4(pkt)
 		require.NoError(t, err)
-		inboundDecoded = append(inboundDecoded, *decoded)
-		inboundACKs.add(decoded.tcpLayer.Ack)
-	}
-	for _, pkt := range outboundPackets {
-		decoded, err := decodeTCP4(pkt)
-		require.NoError(t, err)
-		outboundDecoded = append(outboundDecoded, *decoded)
-		outboundACKs.add(decoded.tcpLayer.Ack)
+		if assert.True(t, decoded.partOf(conn), "received stray packet") {
+			decodedPackets = append(decodedPackets, *decoded)
+			if decoded.destinedFor(conn.RemoteAddr()) {
+				outboundACKs.add(decoded.tcpLayer.Ack)
+			} else {
+				inboundACKs.add(decoded.tcpLayer.Ack)
+			}
+		}
 	}
 
 	sawClientMsg, sawServerMsg := false, false
-	for _, pkt := range inboundDecoded {
-		sawServerMsg = sawServerMsg || bytes.Equal(pkt.payload, []byte(serverMsg))
-		assert.True(
-			t, outboundACKs.contains(pkt.expectedACK()),
-			"expected to see ACK %d from client; actually seen: %v", pkt.expectedACK(), outboundACKs.keys())
-	}
-	for _, pkt := range outboundDecoded {
-		sawClientMsg = sawClientMsg || bytes.Equal(pkt.payload, []byte(clientMsg))
-		assert.True(
-			t, inboundACKs.contains(pkt.expectedACK()),
-			"expected to see ACK %d from server; actually seen: %v", pkt.expectedACK(), inboundACKs.keys())
+	for _, pkt := range decodedPackets {
+		if pkt.destinedFor(conn.RemoteAddr()) {
+			sawClientMsg = sawClientMsg || bytes.Equal(pkt.payload, []byte(clientMsg))
+			assert.True(
+				t, inboundACKs.contains(pkt.expectedACK()),
+				"expected to see ACK %d from server; actually seen: %v", pkt.expectedACK(), inboundACKs.keys())
+		} else {
+			sawServerMsg = sawServerMsg || bytes.Equal(pkt.payload, []byte(serverMsg))
+			assert.True(
+				t, outboundACKs.contains(pkt.expectedACK()),
+				"expected to see ACK %d from client; actually seen: %v", pkt.expectedACK(), outboundACKs.keys())
+		}
 	}
 	assert.True(t, sawClientMsg)
 	assert.True(t, sawServerMsg)

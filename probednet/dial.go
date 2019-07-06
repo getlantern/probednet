@@ -29,42 +29,38 @@ type Packet struct {
 	Timestamp time.Time
 }
 
-// TODO: combine Probes.Inbound and Probes.Outbound
-
-// Probes on a network connection. All channels are buffered and if these buffers fill, data will be
+// Probe on a network connection. All channels are buffered and if these buffers fill, data will be
 // lost.
-type Probes struct {
-	// Inbound and Outbound packets. Packets on these channels will be link-layer packets. The
+type Probe struct {
+	// Packets on the probed connection. Packets on this channels will be link-layer packets. The
 	// specific type depends on the network interface used for the connection. Usually, these will
 	// be ethernet frames. For connections through the loopback interface, these will be loopback
 	// packets and the exact structure depends on your operating system.
-	Inbound, Outbound <-chan Packet
+	Packets <-chan Packet
 
 	Errors <-chan error
 
 	DroppedPackets, DroppedErrors int32
 
 	// Same instances of the above channels, but bi-directional.
-	inbound, outbound chan Packet
-	errors            chan error
+	packets chan Packet
+	errors  chan error
 
 	done chan struct{}
 }
 
-func startProbes(in, out *pcap.Handle) *Probes {
-	p := Probes{
-		inbound:  make(chan Packet, channelBufferSize),
-		outbound: make(chan Packet, channelBufferSize),
-		errors:   make(chan error, channelBufferSize),
-		done:     make(chan struct{}),
+func startProbe(handle *pcap.Handle) *Probe {
+	p := Probe{
+		packets: make(chan Packet, channelBufferSize),
+		errors:  make(chan error, channelBufferSize),
+		done:    make(chan struct{}),
 	}
-	p.Inbound, p.Outbound, p.Errors = p.inbound, p.outbound, p.errors
-	go p.read(in, p.inbound)
-	go p.read(out, p.outbound)
+	p.Packets, p.Errors = p.packets, p.errors
+	go p.read(handle)
 	return &p
 }
 
-func (p *Probes) read(handle *pcap.Handle, packets chan<- Packet) {
+func (p *Probe) read(handle *pcap.Handle) {
 	for {
 		select {
 		case <-p.done:
@@ -80,7 +76,7 @@ func (p *Probes) read(handle *pcap.Handle, packets chan<- Packet) {
 				continue
 			}
 			select {
-			case packets <- Packet{pkt, captureInfo.Timestamp}:
+			case p.packets <- Packet{pkt, captureInfo.Timestamp}:
 			default:
 				atomic.AddInt32(&p.DroppedPackets, 1)
 			}
@@ -89,15 +85,15 @@ func (p *Probes) read(handle *pcap.Handle, packets chan<- Packet) {
 }
 
 // Close the probes. This can be done before or after closing the associated connection.
-func (p *Probes) Close() error {
+func (p *Probe) Close() error {
 	close(p.done)
 	return nil
 }
 
-// Dial behaves like net.Dial, but attaches probes to the connection.
+// Dial behaves like net.Dial, but attaches a probe to the connection.
 //
 // Currently supported networks are "tcp", "tcp4", and "tcp6".
-func Dial(network, address string) (net.Conn, *Probes, error) {
+func Dial(network, address string) (net.Conn, *Probe, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 		raddr, err := net.ResolveTCPAddr(network, address)
@@ -110,52 +106,48 @@ func Dial(network, address string) (net.Conn, *Probes, error) {
 	}
 }
 
-// DialTCP behaves like net.DialTCP, but attaches probes to the connection.
-//
-// Currently supported networks are "tcp", "tcp4", and "tcp6".
-func DialTCP(network string, laddr, raddr *net.TCPAddr) (*net.TCPConn, *Probes, error) {
+// DialTCP behaves like net.DialTCP, but attaches a probe to the connection.
+func DialTCP(network string, laddr, raddr *net.TCPAddr) (*net.TCPConn, *Probe, error) {
 	// TODO: test IPv6
+
+	deferred := new(deferStack)
+	defer deferred.call()
 
 	laddr, freeLaddr, err := chooseLaddr(network, laddr, raddr)
 	if err != nil {
 		return nil, nil, errors.New("failed to set local address: %v", err)
 	}
 
-	bpfIn := fmt.Sprintf("ip dst %v and tcp dst port %d", laddr.IP, laddr.Port)
-	bpfOut := fmt.Sprintf("ip src %v and tcp src port %d", laddr.IP, laddr.Port)
+	bpf := fmt.Sprintf(
+		"(%s) or (%s)",
+		fmt.Sprintf("ip dst %v and tcp dst port %d", laddr.IP, laddr.Port),
+		fmt.Sprintf("ip src %v and tcp src port %d", laddr.IP, laddr.Port),
+	)
 
 	iface, err := getInterface(laddr.IP)
 	if err != nil {
 		return nil, nil, errors.New("failed to obtain interface for connection's local address: %v", err)
 	}
 
-	// TODO: handles need to be closed
-
-	handleIn, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
+	handle, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
 	if err != nil {
 		return nil, nil, errors.New("failed to open pcap handle: %v", err)
 	}
-	if err := handleIn.SetBPFFilter(bpfIn); err != nil {
-		return nil, nil, errors.New("failed to configure capture filter: %v", err)
-	}
-	handleOut, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
-	if err != nil {
-		return nil, nil, errors.New("failed to open pcap handle: %v", err)
-	}
-	if err := handleOut.SetBPFFilter(bpfOut); err != nil {
+	deferred.push(handle.Close)
+	if err := handle.SetBPFFilter(bpf); err != nil {
 		return nil, nil, errors.New("failed to configure capture filter: %v", err)
 	}
 
-	probes := startProbes(handleIn, handleOut)
+	probes := startProbe(handle)
+	deferred.push(func() { probes.Close() })
 	if err := freeLaddr(); err != nil {
-		probes.Close()
 		return nil, nil, errors.New("unable to free local address for use: %v", err)
 	}
 	conn, err := net.DialTCP(network, laddr, raddr)
 	if err != nil {
-		probes.Close()
 		return nil, nil, err
 	}
+	deferred.cancel()
 	return conn, probes, nil
 }
 
