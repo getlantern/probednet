@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +61,12 @@ func (s testServer) serve(responseMsg []byte, errChan chan<- error) {
 	for {
 		conn, err := s.Accept()
 		if err != nil {
+			// This is an unexported error indicating that the listener is closing.
+			// See https://golang.org/pkg/internal/poll/#pkg-variables
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				return
+			}
+
 			errChan <- errors.New("accept failed: %v", err)
 			netErr, ok := err.(net.Error)
 			if ok && netErr.Temporary() {
@@ -172,12 +179,13 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 
 	serverErrors := make(chan error)
 	go func() {
-		select {
-		case err := <-serverErrors:
-			// TODO: this sometimes happens after test completion, resulting in a panic
-			t.Fatal("received error from server:", err)
-		case <-done:
-			return
+		for err := range serverErrors {
+			select {
+			case <-done:
+				return
+			default:
+				t.Fatal(err)
+			}
 		}
 	}()
 	go s.serve([]byte(serverMsg), serverErrors)
