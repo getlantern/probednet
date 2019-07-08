@@ -186,6 +186,10 @@ func TestDialTCP(t *testing.T) {
 		t.Parallel()
 		doTests(t, "tcp6", net.TCPAddr{IP: net.ParseIP("::1")})
 	})
+	t.Run("generic ip", func(t *testing.T) {
+		t.Parallel()
+		testDialTCPHelper(t, "tcp", func() *net.TCPAddr { return nil })
+	})
 }
 
 func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAddr) {
