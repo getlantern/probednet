@@ -102,7 +102,9 @@ func (c *handleReader) readPacket() (done bool) {
 
 	pkt, captureInfo, err := c.handle.ReadPacketData()
 	if err != nil {
-		// TODO: ignore timeout errors
+		if nextErr, ok := err.(pcap.NextError); ok && nextErr == pcap.NextErrorTimeoutExpired {
+			return false
+		}
 		select {
 		case c.captureErrors <- err:
 		default:

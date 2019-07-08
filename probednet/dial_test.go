@@ -192,8 +192,11 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 			packets = append(packets, pkt.Data)
 		}
 	}()
-
-	// TODO: check conn.CaptureErrors
+	go func() {
+		for err := range conn.CaptureErrors() {
+			t.Fatal(err)
+		}
+	}()
 
 	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(timeout)))
 	_, err = conn.Write([]byte(clientMsg))
