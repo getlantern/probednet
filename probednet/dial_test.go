@@ -174,6 +174,7 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 	go func() {
 		select {
 		case err := <-serverErrors:
+			// TODO: this sometimes happens after test completion, resulting in a panic
 			t.Fatal("received error from server:", err)
 		case <-done:
 			return

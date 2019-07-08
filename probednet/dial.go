@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/gopacket/pcap"
@@ -55,7 +56,7 @@ type Conn interface {
 // connections.
 type TCPConn struct {
 	*net.TCPConn
-	handleReader
+	*handleReader
 }
 
 // Close the connection.
@@ -69,7 +70,8 @@ type handleReader struct {
 	handle          *pcap.Handle
 	capturedPackets chan Packet
 	captureErrors   chan error
-	done            chan struct{}
+	done            bool
+	doneLock        *sync.RWMutex
 }
 
 func newHandleReader(handle *pcap.Handle) *handleReader {
@@ -77,33 +79,11 @@ func newHandleReader(handle *pcap.Handle) *handleReader {
 		handle,
 		make(chan Packet, channelBufferSize),
 		make(chan error, channelBufferSize),
-		make(chan struct{}),
+		false,
+		new(sync.RWMutex),
 	}
 	go func() {
-		for {
-			select {
-			case <-hr.done:
-				return
-			default:
-				pkt, captureInfo, err := hr.handle.ReadPacketData()
-				select {
-				case <-hr.done:
-					return
-				default:
-				}
-				if err != nil {
-					// TODO: ignore timeout errors
-					select {
-					case hr.captureErrors <- err:
-					default:
-					}
-					continue
-				}
-				select {
-				case hr.capturedPackets <- Packet{pkt, captureInfo.Timestamp}:
-				default:
-				}
-			}
+		for done := hr.readPacket(); !done; done = hr.readPacket() {
 		}
 	}()
 	return &hr
@@ -111,6 +91,30 @@ func newHandleReader(handle *pcap.Handle) *handleReader {
 
 // The handle reader methods reference the instance as "c" because they appear in docs as methods on
 // connection types like TCPConn.
+
+func (c *handleReader) readPacket() (done bool) {
+	c.doneLock.RLock()
+	defer c.doneLock.RUnlock()
+
+	if c.done {
+		return true
+	}
+
+	pkt, captureInfo, err := c.handle.ReadPacketData()
+	if err != nil {
+		// TODO: ignore timeout errors
+		select {
+		case c.captureErrors <- err:
+		default:
+		}
+		return false
+	}
+	select {
+	case c.capturedPackets <- Packet{pkt, captureInfo.Timestamp}:
+	default:
+	}
+	return false
+}
 
 func (c *handleReader) CapturedPackets() <-chan Packet {
 	return c.capturedPackets
@@ -121,15 +125,17 @@ func (c *handleReader) CaptureErrors() <-chan error {
 }
 
 func (c *handleReader) Close() {
-	select {
-	case <-c.done:
-	default:
-		// Note: pcap.Handle.Close has no return value.
-		c.handle.Close()
-		close(c.done)
-		close(c.capturedPackets)
-		close(c.captureErrors)
+	c.doneLock.Lock()
+	defer c.doneLock.Unlock()
+	if c.done {
+		return
 	}
+
+	// Note: pcap.Handle.Close has no return value.
+	c.handle.Close()
+	close(c.capturedPackets)
+	close(c.captureErrors)
+	c.done = true
 }
 
 func (c *handleReader) CaptureComplete() {
@@ -195,7 +201,7 @@ func DialTCP(network string, laddr, raddr *net.TCPAddr) (*TCPConn, error) {
 		return nil, err
 	}
 	deferred.cancel()
-	return &TCPConn{netConn, *hr}, nil
+	return &TCPConn{netConn, hr}, nil
 }
 
 // Chooses a local address based on the network and remote address. Any fields set on the input
