@@ -6,7 +6,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket/pcap"
@@ -29,85 +28,132 @@ type Packet struct {
 	Timestamp time.Time
 }
 
-// Probe on a network connection. All channels are buffered and if these buffers fill, data will be
-// lost.
-type Probe struct {
-	// Packets on the probed connection. Packets on this channels will be link-layer packets. The
-	// specific type depends on the network interface used for the connection. Usually, these will
-	// be ethernet frames. For connections through the loopback interface, these will be loopback
-	// packets and the exact structure depends on your operating system.
-	Packets <-chan Packet
+// Conn is a network connection with probes capturing packets on the connection.
+type Conn interface {
+	net.Conn
 
-	Errors <-chan error
+	// CapturedPackets can be used to read packets trasmitted as part of the connection. Packets on
+	// this channel will be link-layer packets. The specific type depends on the network interface
+	// used for the connection. Usually, these will be ethernet frames. For connections through the
+	// loopback interface, these will be loopback packets and the exact structure depends on your
+	// operating system.
+	//
+	// This channel will be closed when the connection is closed or CaptureComplete is called.
+	CapturedPackets() <-chan Packet
 
-	DroppedPackets, DroppedErrors int32
+	// CaptureErrors holds errors associated with packet capture. Errors on this channel do not
+	// necessarily indicate errors on the connection.
+	//
+	// This channel will be closed when the connection is closed or CaptureComplete is called.
+	CaptureErrors() <-chan error
 
-	// Same instances of the above channels, but bi-directional.
-	packets chan Packet
-	errors  chan error
-
-	done chan struct{}
+	// CaptureComplete can be used to stop packet capture. The connection itself is unaffected.
+	CaptureComplete()
 }
 
-func startProbe(handle *pcap.Handle) *Probe {
-	p := Probe{
-		packets: make(chan Packet, channelBufferSize),
-		errors:  make(chan error, channelBufferSize),
-		done:    make(chan struct{}),
+// TCPConn - like net.TCPConn - is an implementation of the Conn interface for TCP network
+// connections.
+type TCPConn struct {
+	*net.TCPConn
+	handleReader
+}
+
+// Close the connection.
+func (c *TCPConn) Close() error {
+	// Note: handleReader.Close() has no return value.
+	c.handleReader.Close()
+	return c.TCPConn.Close()
+}
+
+type handleReader struct {
+	handle          *pcap.Handle
+	capturedPackets chan Packet
+	captureErrors   chan error
+	done            chan struct{}
+}
+
+func newHandleReader(handle *pcap.Handle) *handleReader {
+	hr := handleReader{
+		handle,
+		make(chan Packet, channelBufferSize),
+		make(chan error, channelBufferSize),
+		make(chan struct{}),
 	}
-	p.Packets, p.Errors = p.packets, p.errors
-	go p.read(handle)
-	return &p
-}
-
-func (p *Probe) read(handle *pcap.Handle) {
-	for {
-		select {
-		case <-p.done:
-			return
-		default:
-			pkt, captureInfo, err := handle.ReadPacketData()
-			if err != nil {
-				select {
-				case p.errors <- err:
-				default:
-					atomic.AddInt32(&p.DroppedErrors, 1)
-				}
-				continue
-			}
+	go func() {
+		for {
 			select {
-			case p.packets <- Packet{pkt, captureInfo.Timestamp}:
+			case <-hr.done:
+				return
 			default:
-				atomic.AddInt32(&p.DroppedPackets, 1)
+				pkt, captureInfo, err := hr.handle.ReadPacketData()
+				select {
+				case <-hr.done:
+					return
+				default:
+				}
+				if err != nil {
+					// TODO: ignore timeout errors
+					select {
+					case hr.captureErrors <- err:
+					default:
+					}
+					continue
+				}
+				select {
+				case hr.capturedPackets <- Packet{pkt, captureInfo.Timestamp}:
+				default:
+				}
 			}
 		}
+	}()
+	return &hr
+}
+
+// The handle reader methods reference the instance as "c" because they appear in docs as methods on
+// connection types like TCPConn.
+
+func (c *handleReader) CapturedPackets() <-chan Packet {
+	return c.capturedPackets
+}
+
+func (c *handleReader) CaptureErrors() <-chan error {
+	return c.captureErrors
+}
+
+func (c *handleReader) Close() {
+	select {
+	case <-c.done:
+	default:
+		// Note: pcap.Handle.Close has no return value.
+		c.handle.Close()
+		close(c.done)
+		close(c.capturedPackets)
+		close(c.captureErrors)
 	}
 }
 
-// Close the probes. This can be done before or after closing the associated connection.
-func (p *Probe) Close() error {
-	close(p.done)
-	return nil
+func (c *handleReader) CaptureComplete() {
+	c.Close()
 }
 
 // Dial behaves like net.Dial, but attaches a probe to the connection.
 //
 // Currently supported networks are "tcp", "tcp4", and "tcp6".
-func Dial(network, address string) (net.Conn, *Probe, error) {
+func Dial(network, address string) (Conn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 		raddr, err := net.ResolveTCPAddr(network, address)
 		if err != nil {
-			return nil, nil, errors.New("failed to resolve address: %v", err)
+			return nil, errors.New("failed to resolve address: %v", err)
 		}
 		return DialTCP(network, nil, raddr)
 	default:
-		return nil, nil, errors.New("unsupported network")
+		return nil, errors.New("unsupported network")
 	}
 }
 
 // DialTCP behaves like net.DialTCP, but attaches a probe to the connection.
-func DialTCP(network string, laddr, raddr *net.TCPAddr) (*net.TCPConn, *Probe, error) {
+func DialTCP(network string, laddr, raddr *net.TCPAddr) (*TCPConn, error) {
 	// TODO: test IPv6
 
 	deferred := new(deferStack)
@@ -115,8 +161,9 @@ func DialTCP(network string, laddr, raddr *net.TCPAddr) (*net.TCPConn, *Probe, e
 
 	laddr, freeLaddr, err := chooseLaddr(network, laddr, raddr)
 	if err != nil {
-		return nil, nil, errors.New("failed to set local address: %v", err)
+		return nil, errors.New("failed to set local address: %v", err)
 	}
+	deferred.push(func() { freeLaddr() })
 
 	bpf := fmt.Sprintf(
 		"(%s) or (%s)",
@@ -126,29 +173,29 @@ func DialTCP(network string, laddr, raddr *net.TCPAddr) (*net.TCPConn, *Probe, e
 
 	iface, err := getInterface(laddr.IP)
 	if err != nil {
-		return nil, nil, errors.New("failed to obtain interface for connection's local address: %v", err)
+		return nil, errors.New("failed to obtain interface for connection's local address: %v", err)
 	}
 
 	handle, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
 	if err != nil {
-		return nil, nil, errors.New("failed to open pcap handle: %v", err)
+		return nil, errors.New("failed to open pcap handle: %v", err)
 	}
 	deferred.push(handle.Close)
 	if err := handle.SetBPFFilter(bpf); err != nil {
-		return nil, nil, errors.New("failed to configure capture filter: %v", err)
+		return nil, errors.New("failed to configure capture filter: %v", err)
 	}
 
-	probes := startProbe(handle)
-	deferred.push(func() { probes.Close() })
+	hr := newHandleReader(handle)
+	deferred.push(hr.Close)
 	if err := freeLaddr(); err != nil {
-		return nil, nil, errors.New("unable to free local address for use: %v", err)
+		return nil, errors.New("unable to free local address for use: %v", err)
 	}
-	conn, err := net.DialTCP(network, laddr, raddr)
+	netConn, err := net.DialTCP(network, laddr, raddr)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	deferred.cancel()
-	return conn, probes, nil
+	return &TCPConn{netConn, *hr}, nil
 }
 
 // Chooses a local address based on the network and remote address. Any fields set on the input
@@ -174,7 +221,7 @@ func chooseLaddr(network string, laddr, raddr *net.TCPAddr) (*net.TCPAddr, func(
 
 func preferredOutboundIP(remoteIP net.IP) (net.IP, error) {
 	// Note: the choice of port below does not actually matter. It just needs to be non-zero.
-	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: remoteIP, Port: 80})
+	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: remoteIP, Port: 999})
 	if err != nil {
 		return nil, err
 	}

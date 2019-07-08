@@ -181,21 +181,18 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 	}()
 	go s.serve([]byte(serverMsg), serverErrors)
 
-	conn, probes, err := DialTCP(network, laddrFunc(), s.Addr().(*net.TCPAddr))
+	conn, err := DialTCP(network, laddrFunc(), s.Addr().(*net.TCPAddr))
 	require.NoError(t, err)
 	defer conn.Close()
 
 	packets := [][]byte{}
 	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case pkt := <-probes.Packets:
-				packets = append(packets, pkt.Data)
-			}
+		for pkt := range conn.CapturedPackets() {
+			packets = append(packets, pkt.Data)
 		}
 	}()
+
+	// TODO: check conn.CaptureErrors
 
 	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(timeout)))
 	_, err = conn.Write([]byte(clientMsg))
@@ -217,7 +214,7 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 	// Wait for remaining packets to come through, then check whether we saw the packets we expected
 	// to on the probes.
 	time.Sleep(time.Second)
-	probes.Close()
+	conn.CaptureComplete()
 
 	var (
 		decodedPackets            = []tcp4Packet{}
@@ -226,7 +223,7 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 	for _, pkt := range packets {
 		decoded, err := decodeTCP4(pkt)
 		require.NoError(t, err)
-		if assert.True(t, decoded.partOf(conn), "received stray packet") {
+		if assert.True(t, decoded.partOf(conn.TCPConn), "received stray packet") {
 			decodedPackets = append(decodedPackets, *decoded)
 			if decoded.destinedFor(conn.RemoteAddr()) {
 				outboundACKs.add(decoded.tcpLayer.Ack)
