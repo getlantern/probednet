@@ -16,6 +16,144 @@ import (
 	"github.com/getlantern/errors"
 )
 
+func TestDialTCP(t *testing.T) {
+	t.Parallel()
+
+	doTests := func(t *testing.T, network string, localhost0 net.TCPAddr) {
+		t.Run("nil address", func(t *testing.T) {
+			t.Parallel()
+			testDialTCPHelper(t, network, func() *net.TCPAddr { return nil })
+		})
+		t.Run("wildcard port", func(t *testing.T) {
+			t.Parallel()
+			testDialTCPHelper(t, network, func() *net.TCPAddr { return &localhost0 })
+		})
+		t.Run("set port", func(t *testing.T) {
+			t.Parallel()
+			testDialTCPHelper(t, network, func() *net.TCPAddr {
+				l, err := net.ListenTCP(network, &localhost0)
+				require.NoError(t, err)
+				defer l.Close()
+				return l.Addr().(*net.TCPAddr)
+			})
+		})
+	}
+
+	t.Run("ipv4", func(t *testing.T) {
+		t.Parallel()
+		doTests(t, "tcp4", net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	})
+	t.Run("ipv6", func(t *testing.T) {
+		t.Parallel()
+		doTests(t, "tcp6", net.TCPAddr{IP: net.ParseIP("::1")})
+	})
+	t.Run("generic ip", func(t *testing.T) {
+		t.Parallel()
+		testDialTCPHelper(t, "tcp", func() *net.TCPAddr { return nil })
+	})
+}
+
+func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAddr) {
+	t.Helper()
+
+	const (
+		timeout              = time.Second
+		clientMsg, serverMsg = "hello from the client", "hello from the server"
+	)
+
+	done := make(chan struct{})
+	defer close(done)
+
+	s, err := newTestServer(network, "localhost:0")
+	require.NoError(t, err)
+	defer s.Close()
+
+	serverErrors := make(chan error)
+	go func() {
+		for err := range serverErrors {
+			select {
+			case <-done:
+				return
+			default:
+				t.Fatal(err)
+			}
+		}
+	}()
+	go s.serve([]byte(serverMsg), serverErrors)
+
+	conn, err := DialTCP(network, laddrFunc(), s.Addr().(*net.TCPAddr))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	packets := [][]byte{}
+	go func() {
+		for pkt := range conn.CapturedPackets() {
+			packets = append(packets, pkt.Data)
+		}
+	}()
+	go func() {
+		for err := range conn.CaptureErrors() {
+			t.Fatal(err)
+		}
+	}()
+
+	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(timeout)))
+	_, err = conn.Write([]byte(clientMsg))
+	require.NoError(t, err)
+
+	select {
+	case receivedClientMsg := <-s.clientMsgs:
+		assert.Equal(t, []byte(clientMsg), receivedClientMsg)
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for client message")
+	}
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(timeout)))
+	b := make([]byte, 1024)
+	n, err := conn.Read(b)
+	require.NoError(t, err)
+	assert.Equal(t, []byte(serverMsg), b[:n])
+
+	// Wait for remaining packets to come through, then check whether we saw the packets we expected
+	// to on the probes.
+	time.Sleep(time.Second)
+	conn.CaptureComplete()
+
+	var (
+		decodedPackets            = []tcpPacket{}
+		inboundACKs, outboundACKs = uint32Set{}, uint32Set{}
+	)
+	for _, pkt := range packets {
+		decoded, err := decodeTCP(pkt)
+		require.NoError(t, err)
+		if assert.True(t, decoded.partOf(conn.TCPConn), "received stray packet") {
+			decodedPackets = append(decodedPackets, *decoded)
+			if decoded.destinedFor(conn.RemoteAddr()) {
+				outboundACKs.add(decoded.tcpLayer.Ack)
+			} else {
+				inboundACKs.add(decoded.tcpLayer.Ack)
+			}
+		}
+	}
+
+	sawClientMsg, sawServerMsg := false, false
+	for _, pkt := range decodedPackets {
+		if pkt.destinedFor(conn.RemoteAddr()) {
+			sawClientMsg = sawClientMsg || bytes.Equal(pkt.payload, []byte(clientMsg))
+			assert.True(
+				t, inboundACKs.contains(pkt.expectedACK()),
+				"expected to see ACK %d from server; actually seen: %v", pkt.expectedACK(), inboundACKs.keys())
+		} else {
+			sawServerMsg = sawServerMsg || bytes.Equal(pkt.payload, []byte(serverMsg))
+			assert.True(
+				t, outboundACKs.contains(pkt.expectedACK()),
+				"expected to see ACK %d from client; actually seen: %v", pkt.expectedACK(), outboundACKs.keys())
+		}
+	}
+	assert.True(t, sawClientMsg)
+	assert.True(t, sawServerMsg)
+}
+
 type testServer struct {
 	net.Listener
 	maxReceiveMsgSize int
@@ -153,142 +291,4 @@ func (s uint32Set) keys() []uint32 {
 		l = append(l, k)
 	}
 	return l
-}
-
-func TestDialTCP(t *testing.T) {
-	t.Parallel()
-
-	doTests := func(t *testing.T, network string, localhost0 net.TCPAddr) {
-		t.Run("nil address", func(t *testing.T) {
-			t.Parallel()
-			testDialTCPHelper(t, network, func() *net.TCPAddr { return nil })
-		})
-		t.Run("wildcard port", func(t *testing.T) {
-			t.Parallel()
-			testDialTCPHelper(t, network, func() *net.TCPAddr { return &localhost0 })
-		})
-		t.Run("set port", func(t *testing.T) {
-			t.Parallel()
-			testDialTCPHelper(t, network, func() *net.TCPAddr {
-				l, err := net.ListenTCP(network, &localhost0)
-				require.NoError(t, err)
-				defer l.Close()
-				return l.Addr().(*net.TCPAddr)
-			})
-		})
-	}
-
-	t.Run("ipv4", func(t *testing.T) {
-		t.Parallel()
-		doTests(t, "tcp4", net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
-	})
-	t.Run("ipv6", func(t *testing.T) {
-		t.Parallel()
-		doTests(t, "tcp6", net.TCPAddr{IP: net.ParseIP("::1")})
-	})
-	t.Run("generic ip", func(t *testing.T) {
-		t.Parallel()
-		testDialTCPHelper(t, "tcp", func() *net.TCPAddr { return nil })
-	})
-}
-
-func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAddr) {
-	t.Helper()
-
-	const (
-		timeout              = time.Second
-		clientMsg, serverMsg = "hello from the client", "hello from the server"
-	)
-
-	done := make(chan struct{})
-	defer close(done)
-
-	s, err := newTestServer(network, "localhost:0")
-	require.NoError(t, err)
-	defer s.Close()
-
-	serverErrors := make(chan error)
-	go func() {
-		for err := range serverErrors {
-			select {
-			case <-done:
-				return
-			default:
-				t.Fatal(err)
-			}
-		}
-	}()
-	go s.serve([]byte(serverMsg), serverErrors)
-
-	conn, err := DialTCP(network, laddrFunc(), s.Addr().(*net.TCPAddr))
-	require.NoError(t, err)
-	defer conn.Close()
-
-	packets := [][]byte{}
-	go func() {
-		for pkt := range conn.CapturedPackets() {
-			packets = append(packets, pkt.Data)
-		}
-	}()
-	go func() {
-		for err := range conn.CaptureErrors() {
-			t.Fatal(err)
-		}
-	}()
-
-	require.NoError(t, conn.SetWriteDeadline(time.Now().Add(timeout)))
-	_, err = conn.Write([]byte(clientMsg))
-	require.NoError(t, err)
-
-	select {
-	case receivedClientMsg := <-s.clientMsgs:
-		assert.Equal(t, []byte(clientMsg), receivedClientMsg)
-	case <-time.After(timeout):
-		t.Fatal("timed out waiting for client message")
-	}
-
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(timeout)))
-	b := make([]byte, 1024)
-	n, err := conn.Read(b)
-	require.NoError(t, err)
-	assert.Equal(t, []byte(serverMsg), b[:n])
-
-	// Wait for remaining packets to come through, then check whether we saw the packets we expected
-	// to on the probes.
-	time.Sleep(time.Second)
-	conn.CaptureComplete()
-
-	var (
-		decodedPackets            = []tcpPacket{}
-		inboundACKs, outboundACKs = uint32Set{}, uint32Set{}
-	)
-	for _, pkt := range packets {
-		decoded, err := decodeTCP(pkt)
-		require.NoError(t, err)
-		if assert.True(t, decoded.partOf(conn.TCPConn), "received stray packet") {
-			decodedPackets = append(decodedPackets, *decoded)
-			if decoded.destinedFor(conn.RemoteAddr()) {
-				outboundACKs.add(decoded.tcpLayer.Ack)
-			} else {
-				inboundACKs.add(decoded.tcpLayer.Ack)
-			}
-		}
-	}
-
-	sawClientMsg, sawServerMsg := false, false
-	for _, pkt := range decodedPackets {
-		if pkt.destinedFor(conn.RemoteAddr()) {
-			sawClientMsg = sawClientMsg || bytes.Equal(pkt.payload, []byte(clientMsg))
-			assert.True(
-				t, inboundACKs.contains(pkt.expectedACK()),
-				"expected to see ACK %d from server; actually seen: %v", pkt.expectedACK(), inboundACKs.keys())
-		} else {
-			sawServerMsg = sawServerMsg || bytes.Equal(pkt.payload, []byte(serverMsg))
-			assert.True(
-				t, outboundACKs.contains(pkt.expectedACK()),
-				"expected to see ACK %d from client; actually seen: %v", pkt.expectedACK(), outboundACKs.keys())
-		}
-	}
-	assert.True(t, sawClientMsg)
-	assert.True(t, sawServerMsg)
 }
