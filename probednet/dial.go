@@ -162,8 +162,6 @@ func Dial(network, address string) (Conn, error) {
 
 // DialTCP behaves like net.DialTCP, but attaches a probe to the connection.
 func DialTCP(network string, laddr, raddr *net.TCPAddr) (*TCPConn, error) {
-	// TODO: test IPv6
-
 	deferred := new(deferStack)
 	defer deferred.call()
 
@@ -173,10 +171,14 @@ func DialTCP(network string, laddr, raddr *net.TCPAddr) (*TCPConn, error) {
 	}
 	deferred.push(func() { freeLaddr() })
 
+	ipModifier := "ip"
+	if raddr.IP.To4() == nil {
+		ipModifier = "ip6"
+	}
 	bpf := fmt.Sprintf(
 		"(%s) or (%s)",
-		fmt.Sprintf("ip dst %v and tcp dst port %d", laddr.IP, laddr.Port),
-		fmt.Sprintf("ip src %v and tcp src port %d", laddr.IP, laddr.Port),
+		fmt.Sprintf("%s dst %v and tcp dst port %d", ipModifier, laddr.IP, laddr.Port),
+		fmt.Sprintf("%s src %v and tcp src port %d", ipModifier, laddr.IP, laddr.Port),
 	)
 
 	iface, err := getInterface(laddr.IP)

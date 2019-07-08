@@ -78,30 +78,47 @@ func (s testServer) serve(responseMsg []byte, errChan chan<- error) {
 	}
 }
 
-type tcp4Packet struct {
-	ipLayer  layers.IPv4
+type tcpPacket struct {
+	ipLayer struct {
+		SrcIP net.IP
+		DstIP net.IP
+	}
 	tcpLayer layers.TCP
 	payload  gopacket.Payload
 }
 
-// Decodes a link-layer packet encapsulating a TCP/IPv4 packet. Assumes the packet came over the
+// Decodes a link-layer packet encapsulating a TCP/IP packet. Assumes the packet came over the
 // loopback interface.
-func decodeTCP4(linkPacket []byte) (*tcp4Packet, error) {
-	decoded := tcp4Packet{}
+func decodeTCP(linkPacket []byte) (*tcpPacket, error) {
+	var (
+		ip4        layers.IPv4
+		ip6        layers.IPv6
+		decoded    tcpPacket
+		layerTypes = []gopacket.LayerType{}
+	)
 	parser := gopacket.NewDecodingLayerParser(
 		layers.LayerTypeLoopback,
 		&layers.Loopback{},
-		&decoded.ipLayer,
+		&ip4,
+		&ip6,
 		&decoded.tcpLayer,
 		&decoded.payload,
 	)
-	if err := parser.DecodeLayers(linkPacket, &[]gopacket.LayerType{}); err != nil {
+	if err := parser.DecodeLayers(linkPacket, &layerTypes); err != nil {
 		return nil, err
+	}
+	for _, layerType := range layerTypes {
+		switch layerType {
+		case layers.LayerTypeIPv4:
+			decoded.ipLayer.SrcIP, decoded.ipLayer.DstIP = ip4.SrcIP, ip4.DstIP
+		case layers.LayerTypeIPv6:
+			decoded.ipLayer.SrcIP, decoded.ipLayer.DstIP = ip6.SrcIP, ip6.DstIP
+		}
 	}
 	return &decoded, nil
 }
 
-func (p tcp4Packet) expectedACK() uint32 {
+func (p tcpPacket) expectedACK() uint32 {
 	if p.tcpLayer.SYN {
 		return p.tcpLayer.Seq + 1
 	}
@@ -109,7 +126,7 @@ func (p tcp4Packet) expectedACK() uint32 {
 }
 
 // True iff this is a packet routed between conn.LocalAddr() and conn.RemoteAddr().
-func (p tcp4Packet) partOf(conn *net.TCPConn) bool {
+func (p tcpPacket) partOf(conn *net.TCPConn) bool {
 	correctSrcAndDst := func(src, dst *net.TCPAddr) bool {
 		return bytes.Equal(p.ipLayer.SrcIP, src.IP) &&
 			bytes.Equal(p.ipLayer.DstIP, dst.IP) &&
@@ -120,7 +137,7 @@ func (p tcp4Packet) partOf(conn *net.TCPConn) bool {
 	return correctSrcAndDst(laddr, raddr) || correctSrcAndDst(raddr, laddr)
 }
 
-func (p tcp4Packet) destinedFor(addr net.Addr) bool {
+func (p tcpPacket) destinedFor(addr net.Addr) bool {
 	tcpAddr := addr.(*net.TCPAddr)
 	return bytes.Equal(p.ipLayer.DstIP, tcpAddr.IP) && int(p.tcpLayer.DstPort) == tcpAddr.Port
 }
@@ -141,24 +158,33 @@ func (s uint32Set) keys() []uint32 {
 func TestDialTCP(t *testing.T) {
 	t.Parallel()
 
-	localhost0 := net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
-
-	t.Run("nil address", func(t *testing.T) {
-		t.Parallel()
-		testDialTCPHelper(t, "tcp4", func() *net.TCPAddr { return nil })
-	})
-	t.Run("wildcard port", func(t *testing.T) {
-		t.Parallel()
-		testDialTCPHelper(t, "tcp4", func() *net.TCPAddr { return &localhost0 })
-	})
-	t.Run("set port", func(t *testing.T) {
-		t.Parallel()
-		testDialTCPHelper(t, "tcp4", func() *net.TCPAddr {
-			l, err := net.ListenTCP("tcp4", &localhost0)
-			require.NoError(t, err)
-			defer l.Close()
-			return l.Addr().(*net.TCPAddr)
+	doTests := func(t *testing.T, network string, localhost0 net.TCPAddr) {
+		t.Run("nil address", func(t *testing.T) {
+			t.Parallel()
+			testDialTCPHelper(t, network, func() *net.TCPAddr { return nil })
 		})
+		t.Run("wildcard port", func(t *testing.T) {
+			t.Parallel()
+			testDialTCPHelper(t, network, func() *net.TCPAddr { return &localhost0 })
+		})
+		t.Run("set port", func(t *testing.T) {
+			t.Parallel()
+			testDialTCPHelper(t, network, func() *net.TCPAddr {
+				l, err := net.ListenTCP(network, &localhost0)
+				require.NoError(t, err)
+				defer l.Close()
+				return l.Addr().(*net.TCPAddr)
+			})
+		})
+	}
+
+	t.Run("ipv4", func(t *testing.T) {
+		t.Parallel()
+		doTests(t, "tcp4", net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	})
+	t.Run("ipv6", func(t *testing.T) {
+		t.Parallel()
+		doTests(t, "tcp6", net.TCPAddr{IP: net.ParseIP("::1")})
 	})
 }
 
@@ -229,11 +255,11 @@ func testDialTCPHelper(t *testing.T, network string, laddrFunc func() *net.TCPAd
 	conn.CaptureComplete()
 
 	var (
-		decodedPackets            = []tcp4Packet{}
+		decodedPackets            = []tcpPacket{}
 		inboundACKs, outboundACKs = uint32Set{}, uint32Set{}
 	)
 	for _, pkt := range packets {
-		decoded, err := decodeTCP4(pkt)
+		decoded, err := decodeTCP(pkt)
 		require.NoError(t, err)
 		if assert.True(t, decoded.partOf(conn.TCPConn), "received stray packet") {
 			decodedPackets = append(decodedPackets, *decoded)
