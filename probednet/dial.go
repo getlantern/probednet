@@ -66,6 +66,20 @@ func (c *TCPConn) Close() error {
 	return c.TCPConn.Close()
 }
 
+// UDPConn - like net.UDPConn - is the implementation of the Conn and net.PacketConn interfaces for
+// UDP network connections.
+type UDPConn struct {
+	*net.UDPConn
+	*handleReader
+}
+
+// Close the connection.
+func (c *UDPConn) Close() error {
+	// Note: handleReader.Close() has no return value.
+	c.handleReader.Close()
+	return c.UDPConn.Close()
+}
+
 type handleReader struct {
 	handle          *pcap.Handle
 	capturedPackets chan Packet
@@ -74,7 +88,51 @@ type handleReader struct {
 	doneLock        *sync.RWMutex
 }
 
-func newHandleReader(handle *pcap.Handle) *handleReader {
+func newHandleReader(laddr net.Addr) (*handleReader, error) {
+	var (
+		ip        net.IP
+		port      int
+		transport string
+	)
+
+	switch laddr := laddr.(type) {
+	case *net.TCPAddr:
+		ip = laddr.IP
+		port = laddr.Port
+		transport = "tcp"
+	case *net.UDPAddr:
+		ip = laddr.IP
+		port = laddr.Port
+		transport = "udp"
+	default:
+		return nil, errors.New("unsupported address type %T", laddr)
+	}
+
+	network := "ip"
+	if ip.To4() == nil {
+		network = "ip6"
+	}
+
+	bpf := fmt.Sprintf(
+		"(%s) or (%s)",
+		fmt.Sprintf("%s dst %v and %s dst port %d", network, ip, transport, port),
+		fmt.Sprintf("%s src %v and %s src port %d", network, ip, transport, port),
+	)
+
+	iface, err := getInterface(ip)
+	if err != nil {
+		return nil, errors.New("failed to obtain interface for connection's local address: %v", err)
+	}
+
+	handle, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
+	if err != nil {
+		return nil, errors.New("failed to open pcap handle: %v", err)
+	}
+	if err := handle.SetBPFFilter(bpf); err != nil {
+		handle.Close()
+		return nil, errors.New("failed to configure capture filter: %v", err)
+	}
+
 	hr := handleReader{
 		handle,
 		make(chan Packet, channelBufferSize),
@@ -83,19 +141,18 @@ func newHandleReader(handle *pcap.Handle) *handleReader {
 		new(sync.RWMutex),
 	}
 	go func() {
-		for done := hr.readPacket(); !done; done = hr.readPacket() {
+		for done := false; !done; done = hr.readPacket() {
 		}
 	}()
-	return &hr
+	return &hr, nil
 }
 
-// The handle reader methods reference the instance as "c" because they appear in docs as methods on
+// The handleReader methods reference the instance as "c" because they appear in docs as methods on
 // connection types like TCPConn.
 
 func (c *handleReader) readPacket() (done bool) {
 	c.doneLock.RLock()
 	defer c.doneLock.RUnlock()
-
 	if c.done {
 		return true
 	}
@@ -155,6 +212,12 @@ func Dial(network, address string) (Conn, error) {
 			return nil, errors.New("failed to resolve address: %v", err)
 		}
 		return DialTCP(network, nil, raddr)
+	case "udp", "udp4", "udp6":
+		raddr, err := net.ResolveUDPAddr(network, address)
+		if err != nil {
+			return nil, errors.New("failed to resolve address: %v", err)
+		}
+		return DialUDP(network, nil, raddr)
 	default:
 		return nil, errors.New("unsupported network")
 	}
@@ -165,37 +228,16 @@ func DialTCP(network string, laddr, raddr *net.TCPAddr) (*TCPConn, error) {
 	deferred := new(deferStack)
 	defer deferred.call()
 
-	laddr, freeLaddr, err := chooseLaddr(network, laddr, raddr)
+	laddr, freeLaddr, err := chooseLaddrTCP(network, laddr, raddr)
 	if err != nil {
 		return nil, errors.New("failed to set local address: %v", err)
 	}
 	deferred.push(func() { freeLaddr() })
 
-	ipModifier := "ip"
-	if raddr.IP.To4() == nil {
-		ipModifier = "ip6"
-	}
-	bpf := fmt.Sprintf(
-		"(%s) or (%s)",
-		fmt.Sprintf("%s dst %v and tcp dst port %d", ipModifier, laddr.IP, laddr.Port),
-		fmt.Sprintf("%s src %v and tcp src port %d", ipModifier, laddr.IP, laddr.Port),
-	)
-
-	iface, err := getInterface(laddr.IP)
+	hr, err := newHandleReader(laddr)
 	if err != nil {
-		return nil, errors.New("failed to obtain interface for connection's local address: %v", err)
+		return nil, errors.New("failed to open capture handle: %v", err)
 	}
-
-	handle, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
-	if err != nil {
-		return nil, errors.New("failed to open pcap handle: %v", err)
-	}
-	deferred.push(handle.Close)
-	if err := handle.SetBPFFilter(bpf); err != nil {
-		return nil, errors.New("failed to configure capture filter: %v", err)
-	}
-
-	hr := newHandleReader(handle)
 	deferred.push(hr.Close)
 	if err := freeLaddr(); err != nil {
 		return nil, errors.New("unable to free local address for use: %v", err)
@@ -208,10 +250,37 @@ func DialTCP(network string, laddr, raddr *net.TCPAddr) (*TCPConn, error) {
 	return &TCPConn{netConn, hr}, nil
 }
 
+// DialUDP behaves like net.DialUDP, but attaches a probe to the connection.
+func DialUDP(network string, laddr, raddr *net.UDPAddr) (*UDPConn, error) {
+	deferred := new(deferStack)
+	defer deferred.call()
+
+	laddr, freeLaddr, err := chooseLaddrUDP(network, laddr, raddr)
+	if err != nil {
+		return nil, errors.New("failed to set local address: %v", err)
+	}
+	deferred.push(func() { freeLaddr() })
+
+	hr, err := newHandleReader(laddr)
+	if err != nil {
+		return nil, errors.New("failed to open capture handle: %v", err)
+	}
+	deferred.push(hr.Close)
+	if err := freeLaddr(); err != nil {
+		return nil, errors.New("unable to free local address for use: %v", err)
+	}
+	netConn, err := net.DialUDP(network, laddr, raddr)
+	if err != nil {
+		return nil, err
+	}
+	deferred.cancel()
+	return &UDPConn{netConn, hr}, nil
+}
+
 // Chooses a local address based on the network and remote address. Any fields set on the input
 // local address will be honored. Returns the selected local address and a function to free the
 // port. The free function should be called immediately before using the address.
-func chooseLaddr(network string, laddr, raddr *net.TCPAddr) (*net.TCPAddr, func() error, error) {
+func chooseLaddrTCP(network string, laddr, raddr *net.TCPAddr) (*net.TCPAddr, func() error, error) {
 	if laddr == nil {
 		outboundIP, err := preferredOutboundIP(raddr.IP)
 		if err != nil {
@@ -225,6 +294,27 @@ func chooseLaddr(network string, laddr, raddr *net.TCPAddr) (*net.TCPAddr, func(
 			return nil, nil, errors.New("failed to find free port: %v", err)
 		}
 		return l.Addr().(*net.TCPAddr), l.Close, nil
+	}
+	return laddr, func() error { return nil }, nil
+}
+
+// Chooses a local address based on the network and remote address. Any fields set on the input
+// local address will be honored. Returns the selected local address and a function to free the
+// port. The free function should be called immediately before using the address.
+func chooseLaddrUDP(network string, laddr, raddr *net.UDPAddr) (*net.UDPAddr, func() error, error) {
+	if laddr == nil {
+		outboundIP, err := preferredOutboundIP(raddr.IP)
+		if err != nil {
+			return nil, nil, errors.New("no route to remote: %v", err)
+		}
+		laddr = &net.UDPAddr{IP: outboundIP}
+	}
+	if laddr.Port == 0 {
+		conn, err := net.ListenUDP(network, laddr)
+		if err != nil {
+			return nil, nil, errors.New("failed to find free port: %v", err)
+		}
+		return conn.LocalAddr().(*net.UDPAddr), conn.Close, nil
 	}
 	return laddr, func() error { return nil }, nil
 }
