@@ -1,4 +1,12 @@
 // Package probednet offers utilities for probing constructions of the net package.
+//
+// Note that packet capture usually requires elevated permissions and the functions in this package
+// are no exception.
+//
+// TODO: figure out libraries required per OS. It's likely:
+//		- libpcap-dev for Linux
+//		- winpcap or npcap for Windows
+//		- libpcap for Mac OS (installed by default?)
 package probednet
 
 import (
