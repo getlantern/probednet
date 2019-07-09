@@ -16,6 +16,19 @@ import (
 	"github.com/getlantern/errors"
 )
 
+func TestTypes(t *testing.T) {
+	var (
+		tcpConn *TCPConn
+		udpConn *UDPConn
+	)
+
+	assert.Implements(t, (*net.Conn)(nil), tcpConn)
+	assert.Implements(t, (*net.Conn)(nil), udpConn)
+	assert.Implements(t, (*Conn)(nil), tcpConn)
+	assert.Implements(t, (*Conn)(nil), udpConn)
+	assert.Implements(t, (*net.PacketConn)(nil), udpConn)
+}
+
 func TestDialTCP(t *testing.T) {
 	t.Parallel()
 
