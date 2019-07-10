@@ -1,4 +1,4 @@
-module github.com/getlantern/probe
+module github.com/getlantern/probednet
 
 go 1.12
 
