@@ -129,7 +129,12 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 		clientMsg, serverMsg = "hello from the client", "hello from the server"
 	)
 
-	s, err := newTestServer(network, "localhost:0")
+	localhost0 := "127.0.0.1:0"
+	if network == "tcp6" || network == "udp6" {
+		localhost0 = "[::1]:0"
+	}
+
+	s, err := newTestServer(network, localhost0)
 	require.NoError(t, err)
 	defer s.Close()
 
