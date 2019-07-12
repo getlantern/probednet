@@ -27,7 +27,8 @@ var tcpFlags = []struct {
 }
 
 // Note that captured packets will be link-layer packets. If we were connecting to a host on the
-// loopback interface, we would need to use loopback decoders instead of ethernet decoders below.
+// loopback interface, we may need to use loopback decoders instead of ethernet decoders below. This
+// depends on your OS.
 func sprintTCP(linkPacket []byte) string {
 	var (
 		ip4        layers.IPv4
