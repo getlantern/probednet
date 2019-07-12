@@ -24,7 +24,12 @@ import (
 
 const (
 	// Warning: do not set to >= 1 second: https://github.com/google/gopacket/issues/499
-	packetReadTimeout = 500 * time.Millisecond
+	packetReadTimeout = 100 * time.Millisecond
+
+	// We introduce a brief delay before closing the packet capture handle. This is basically time
+	// between a call to handleReader.Close and handleReader actually ceasing to read packets and
+	// closing the packet channel. From testing different options, this delay seems to work well.
+	handleCloseDelay = time.Second
 
 	channelBufferSize = 1000
 )
@@ -47,7 +52,11 @@ type Conn interface {
 	// loopback interface, these will be loopback packets and the exact structure depends on your
 	// operating system.
 	//
-	// This channel will be closed when the connection is closed or CaptureComplete is called.
+	// Note that there is a delay in capturing packets.
+	//
+	// This channel will be closed when the connection is closed or CaptureComplete is called. When
+	// the connection is closed, there will be a short delay before the channel is closed to ensure
+	// that the final packets are captured.
 	CapturedPackets() <-chan Packet
 
 	// CaptureErrors holds errors associated with packet capture. Errors on this channel do not
@@ -69,8 +78,8 @@ type TCPConn struct {
 
 // Close the connection.
 func (c *TCPConn) Close() error {
-	// Note: handleReader.Close() has no return value.
-	c.handleReader.Close()
+	// Close the handle reader after closing the connection to ensure we capture the final packets.
+	defer c.handleReader.Close()
 	return c.TCPConn.Close()
 }
 
@@ -83,8 +92,8 @@ type UDPConn struct {
 
 // Close the connection.
 func (c *UDPConn) Close() error {
-	// Note: handleReader.Close() has no return value.
-	c.handleReader.Close()
+	// Close the handle reader after closing the connection to ensure we capture the final packets.
+	defer c.handleReader.Close()
 	return c.UDPConn.Close()
 }
 
@@ -192,6 +201,14 @@ func (c *handleReader) CaptureErrors() <-chan error {
 }
 
 func (c *handleReader) Close() {
+	// Wait a bit before closing the handle to ensure we capture remaining transmitted packets.
+	go func() {
+		time.Sleep(handleCloseDelay)
+		c.CaptureComplete()
+	}()
+}
+
+func (c *handleReader) CaptureComplete() {
 	c.doneLock.Lock()
 	defer c.doneLock.Unlock()
 	if c.done {
@@ -203,10 +220,6 @@ func (c *handleReader) Close() {
 	close(c.capturedPackets)
 	close(c.captureErrors)
 	c.done = true
-}
-
-func (c *handleReader) CaptureComplete() {
-	c.Close()
 }
 
 // Dial behaves like net.Dial, but attaches a probe to the connection.

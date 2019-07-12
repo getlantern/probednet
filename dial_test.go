@@ -151,13 +151,14 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 
 	conn, err := dial(s.Addr())
 	require.NoError(t, err)
-	defer conn.Close()
 
 	packets := [][]byte{}
+	captureComplete := make(chan struct{})
 	go func() {
 		for pkt := range conn.CapturedPackets() {
 			packets = append(packets, pkt.Data)
 		}
+		close(captureComplete)
 	}()
 	go func() {
 		for err := range conn.CaptureErrors() {
@@ -184,8 +185,8 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 
 	// Wait for remaining packets to come through, then check whether we saw the packets we expected
 	// to on the probes.
-	time.Sleep(time.Second)
-	conn.CaptureComplete()
+	conn.Close()
+	<-captureComplete
 
 	decodedPackets := []decodedPacket{}
 	sawClientMsg, sawServerMsg := false, false
