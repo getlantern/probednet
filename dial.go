@@ -69,7 +69,7 @@ type Conn interface {
 	CaptureComplete()
 }
 
-// TCPConn - like net.TCPConn - is an implementation of the Conn interface for TCP network
+// TCPConn - like net.TCPConn - is the implementation of the Conn interface for TCP network
 // connections.
 type TCPConn struct {
 	*net.TCPConn
@@ -224,7 +224,7 @@ func (c *handleReader) CaptureComplete() {
 
 // Dial behaves like net.Dial, but attaches a probe to the connection.
 //
-// Currently supported networks are "tcp", "tcp4", and "tcp6".
+// Supported networks are "tcp", "tcp4", "tcp6", "udp", "udp4", and "udp6".
 func Dial(network, address string) (Conn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":

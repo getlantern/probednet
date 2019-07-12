@@ -183,8 +183,7 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 	require.NoError(t, err)
 	assert.Equal(t, []byte(serverMsg), b[:n])
 
-	// Wait for remaining packets to come through, then check whether we saw the packets we expected
-	// to on the probes.
+	// Wait for remaining packets to come through, then check whether we saw the expected packets.
 	conn.Close()
 	<-captureComplete
 
