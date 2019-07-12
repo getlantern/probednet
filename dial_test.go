@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -379,29 +380,43 @@ type decodedPacket struct {
 	payload  gopacket.Payload
 }
 
-// Decodes a link-layer packet. Assumes the packet came over the loopback interface.
+// Decodes a link-layer packet.
 func decodePacket(linkPacket []byte) (*decodedPacket, error) {
 	var (
-		ip4        layers.IPv4
-		ip6        layers.IPv6
-		tcp        layers.TCP
-		udp        layers.UDP
-		decoded    decodedPacket
-		layerTypes = []gopacket.LayerType{}
+		ip4     layers.IPv4
+		ip6     layers.IPv6
+		tcp     layers.TCP
+		udp     layers.UDP
+		decoded decodedPacket
+
+		linkLayerType gopacket.LayerType
+		linkLayer     gopacket.DecodingLayer
+
+		decodedLayerTypes = []gopacket.LayerType{}
 	)
+
+	switch runtime.GOOS {
+	case "linux":
+		linkLayerType = layers.LayerTypeEthernet
+		linkLayer = &layers.Ethernet{}
+	default:
+		linkLayerType = layers.LayerTypeLoopback
+		linkLayer = &layers.Loopback{}
+	}
+
 	parser := gopacket.NewDecodingLayerParser(
-		layers.LayerTypeLoopback,
-		&layers.Loopback{},
+		linkLayerType,
+		linkLayer,
 		&ip4,
 		&ip6,
 		&tcp,
 		&udp,
 		&decoded.payload,
 	)
-	if err := parser.DecodeLayers(linkPacket, &layerTypes); err != nil {
+	if err := parser.DecodeLayers(linkPacket, &decodedLayerTypes); err != nil {
 		return nil, err
 	}
-	for _, layerType := range layerTypes {
+	for _, layerType := range decodedLayerTypes {
 		switch layerType {
 		case layers.LayerTypeIPv4:
 			decoded.ipLayer.srcIP, decoded.ipLayer.dstIP = ip4.SrcIP, ip4.DstIP
