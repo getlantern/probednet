@@ -4,17 +4,15 @@ import (
 	"bytes"
 	"io"
 	"net"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/errors"
+	"github.com/getlantern/probednet/pktutil"
 )
 
 func TestTypes(t *testing.T) {
@@ -122,7 +120,7 @@ func TestDialUDP(t *testing.T) {
 
 type dialFunc func(net.Addr) (Conn, error)
 
-func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decodedPacket, remote net.Addr) {
+func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []pktutil.TransportPacket, remote net.Addr) {
 	t.Helper()
 
 	const (
@@ -193,17 +191,17 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 	conn.Close()
 	<-captureComplete
 
-	decodedPackets := []decodedPacket{}
+	decodedPackets := []pktutil.TransportPacket{}
 	sawClientMsg, sawServerMsg := false, false
 	for _, raw := range packets {
-		pkt, err := decodePacket(raw)
+		pkt, err := pktutil.DecodeTransportPacket(raw)
 		require.NoError(t, err)
-		if assert.True(t, pkt.partOf(conn), "received stray packet") {
+		if assert.True(t, pkt.PartOf(conn), "received stray packet") {
 			decodedPackets = append(decodedPackets, *pkt)
-			if pkt.destinedFor(conn.RemoteAddr()) {
-				sawClientMsg = sawClientMsg || bytes.Equal(pkt.payload, []byte(clientMsg))
+			if pkt.DestinedFor(conn.RemoteAddr()) {
+				sawClientMsg = sawClientMsg || bytes.Equal(pkt.Payload, []byte(clientMsg))
 			} else {
-				sawServerMsg = sawServerMsg || bytes.Equal(pkt.payload, []byte(serverMsg))
+				sawServerMsg = sawServerMsg || bytes.Equal(pkt.Payload, []byte(serverMsg))
 			}
 		}
 	}
@@ -214,27 +212,27 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 }
 
 // Assumes all packets are TCP packets and part of the same connection.
-func checkACKs(t *testing.T, packets []decodedPacket, remote net.Addr) {
+func checkACKs(t *testing.T, packets []pktutil.TransportPacket, remote net.Addr) {
 	t.Helper()
 
 	inboundACKs, outboundACKs := uint32Set{}, uint32Set{}
 	for _, pkt := range packets {
-		if pkt.destinedFor(remote) {
-			outboundACKs.add(pkt.tcpLayer.Ack)
+		if pkt.DestinedFor(remote) {
+			outboundACKs.add(pkt.TCPLayer.Ack)
 		} else {
-			inboundACKs.add(pkt.tcpLayer.Ack)
+			inboundACKs.add(pkt.TCPLayer.Ack)
 		}
 	}
 
 	for _, pkt := range packets {
-		if pkt.destinedFor(remote) {
+		if pkt.DestinedFor(remote) {
 			assert.True(
-				t, inboundACKs.contains(pkt.expectedACK()),
-				"expected to see ACK %d from server; actually seen: %v", pkt.expectedACK(), inboundACKs.keys())
+				t, inboundACKs.contains(pkt.ExpectedACK()),
+				"expected to see ACK %d from server; actually seen: %v", pkt.ExpectedACK(), inboundACKs.keys())
 		} else {
 			assert.True(
-				t, outboundACKs.contains(pkt.expectedACK()),
-				"expected to see ACK %d from client; actually seen: %v", pkt.expectedACK(), outboundACKs.keys())
+				t, outboundACKs.contains(pkt.ExpectedACK()),
+				"expected to see ACK %d from client; actually seen: %v", pkt.ExpectedACK(), outboundACKs.keys())
 		}
 	}
 }
@@ -369,135 +367,6 @@ func (s testUDPServer) clientMsgsChan() <-chan []byte {
 
 func (s testUDPServer) Addr() net.Addr {
 	return s.LocalAddr()
-}
-
-type decodedPacket struct {
-	ipLayer struct {
-		srcIP, dstIP net.IP
-	}
-	tcpLayer *layers.TCP
-	udpLayer *layers.UDP
-	payload  gopacket.Payload
-}
-
-// Decodes a link-layer packet.
-func decodePacket(linkPacket []byte) (*decodedPacket, error) {
-	var (
-		ip4     layers.IPv4
-		ip6     layers.IPv6
-		tcp     layers.TCP
-		udp     layers.UDP
-		decoded decodedPacket
-
-		linkLayerType gopacket.LayerType
-		linkLayer     gopacket.DecodingLayer
-
-		decodedLayerTypes = []gopacket.LayerType{}
-	)
-
-	switch runtime.GOOS {
-	case "linux":
-		linkLayerType = layers.LayerTypeEthernet
-		linkLayer = &layers.Ethernet{}
-	default:
-		linkLayerType = layers.LayerTypeLoopback
-		linkLayer = &layers.Loopback{}
-	}
-
-	parser := gopacket.NewDecodingLayerParser(
-		linkLayerType,
-		linkLayer,
-		&ip4,
-		&ip6,
-		&tcp,
-		&udp,
-		&decoded.payload,
-	)
-	if err := parser.DecodeLayers(linkPacket, &decodedLayerTypes); err != nil {
-		return nil, err
-	}
-	for _, layerType := range decodedLayerTypes {
-		switch layerType {
-		case layers.LayerTypeIPv4:
-			decoded.ipLayer.srcIP, decoded.ipLayer.dstIP = ip4.SrcIP, ip4.DstIP
-		case layers.LayerTypeIPv6:
-			decoded.ipLayer.srcIP, decoded.ipLayer.dstIP = ip6.SrcIP, ip6.DstIP
-		case layers.LayerTypeTCP:
-			decoded.tcpLayer = &tcp
-		case layers.LayerTypeUDP:
-			decoded.udpLayer = &udp
-		}
-	}
-	return &decoded, nil
-}
-
-func (p decodedPacket) expectedACK() uint32 {
-	if p.tcpLayer == nil {
-		return 0
-	}
-	if p.tcpLayer.SYN {
-		return p.tcpLayer.Seq + 1
-	}
-	return p.tcpLayer.Seq + uint32(len(p.payload))
-}
-
-// True iff this is a packet routed between conn.LocalAddr() and conn.RemoteAddr().
-func (p decodedPacket) partOf(conn Conn) bool {
-	switch conn := conn.(type) {
-	case *TCPConn:
-		return p.partOfTCP(conn)
-	case *UDPConn:
-		return p.partOfUDP(conn)
-	default:
-		panic("unexpected connection type")
-	}
-}
-
-func (p decodedPacket) partOfTCP(conn *TCPConn) bool {
-	if p.tcpLayer == nil {
-		return false
-	}
-
-	correctSrcAndDst := func(src, dst *net.TCPAddr) bool {
-		return bytes.Equal(p.ipLayer.srcIP, src.IP) &&
-			bytes.Equal(p.ipLayer.dstIP, dst.IP) &&
-			int(p.tcpLayer.SrcPort) == src.Port &&
-			int(p.tcpLayer.DstPort) == dst.Port
-	}
-	laddr, raddr := conn.LocalAddr().(*net.TCPAddr), conn.RemoteAddr().(*net.TCPAddr)
-	return correctSrcAndDst(laddr, raddr) || correctSrcAndDst(raddr, laddr)
-}
-
-func (p decodedPacket) partOfUDP(conn *UDPConn) bool {
-	if p.udpLayer == nil {
-		return false
-	}
-
-	correctSrcAndDst := func(src, dst *net.UDPAddr) bool {
-		return bytes.Equal(p.ipLayer.srcIP, src.IP) &&
-			bytes.Equal(p.ipLayer.dstIP, dst.IP) &&
-			int(p.udpLayer.SrcPort) == src.Port &&
-			int(p.udpLayer.DstPort) == dst.Port
-	}
-	laddr, raddr := conn.LocalAddr().(*net.UDPAddr), conn.RemoteAddr().(*net.UDPAddr)
-	return correctSrcAndDst(laddr, raddr) || correctSrcAndDst(raddr, laddr)
-}
-
-func (p decodedPacket) destinedFor(addr net.Addr) bool {
-	switch addr := addr.(type) {
-	case *net.TCPAddr:
-		if p.tcpLayer == nil {
-			return false
-		}
-		return bytes.Equal(p.ipLayer.dstIP, addr.IP) && int(p.tcpLayer.DstPort) == addr.Port
-	case *net.UDPAddr:
-		if p.udpLayer == nil {
-			return false
-		}
-		return bytes.Equal(p.ipLayer.dstIP, addr.IP) && int(p.udpLayer.DstPort) == addr.Port
-	default:
-		panic("unrecognized address type")
-	}
 }
 
 type uint32Set map[uint32]bool
