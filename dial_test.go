@@ -1,4 +1,4 @@
-package probednet
+package probednet_test
 
 import (
 	"bytes"
@@ -15,18 +15,20 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/getlantern/errors"
+	"github.com/getlantern/probednet"
+	"github.com/getlantern/probednet/pktutil"
 )
 
 func TestTypes(t *testing.T) {
 	var (
-		tcpConn *TCPConn
-		udpConn *UDPConn
+		tcpConn *probednet.TCPConn
+		udpConn *probednet.UDPConn
 	)
 
 	assert.Implements(t, (*net.Conn)(nil), tcpConn)
 	assert.Implements(t, (*net.Conn)(nil), udpConn)
-	assert.Implements(t, (*Conn)(nil), tcpConn)
-	assert.Implements(t, (*Conn)(nil), udpConn)
+	assert.Implements(t, (*probednet.Conn)(nil), tcpConn)
+	assert.Implements(t, (*probednet.Conn)(nil), udpConn)
 	assert.Implements(t, (*net.PacketConn)(nil), udpConn)
 }
 
@@ -36,25 +38,25 @@ func TestDialTCP(t *testing.T) {
 	doTests := func(t *testing.T, network string, localhost0 net.TCPAddr) {
 		t.Run("nil address", func(t *testing.T) {
 			t.Parallel()
-			pkts, remote := testDialAndCapture(t, network, func(addr net.Addr) (Conn, error) {
-				return DialTCP(network, nil, addr.(*net.TCPAddr))
+			pkts, remote := testDialAndCapture(t, network, func(addr net.Addr) (probednet.Conn, error) {
+				return probednet.DialTCP(network, nil, addr.(*net.TCPAddr))
 			})
 			checkACKs(t, pkts, remote)
 		})
 		t.Run("wildcard port", func(t *testing.T) {
 			t.Parallel()
-			pkts, remote := testDialAndCapture(t, network, func(addr net.Addr) (Conn, error) {
-				return DialTCP(network, &localhost0, addr.(*net.TCPAddr))
+			pkts, remote := testDialAndCapture(t, network, func(addr net.Addr) (probednet.Conn, error) {
+				return probednet.DialTCP(network, &localhost0, addr.(*net.TCPAddr))
 			})
 			checkACKs(t, pkts, remote)
 		})
 		t.Run("set port", func(t *testing.T) {
 			t.Parallel()
-			pkts, remote := testDialAndCapture(t, network, func(addr net.Addr) (Conn, error) {
+			pkts, remote := testDialAndCapture(t, network, func(addr net.Addr) (probednet.Conn, error) {
 				l, err := net.ListenTCP(network, &localhost0)
 				require.NoError(t, err)
 				require.NoError(t, l.Close())
-				return DialTCP(network, l.Addr().(*net.TCPAddr), addr.(*net.TCPAddr))
+				return probednet.DialTCP(network, l.Addr().(*net.TCPAddr), addr.(*net.TCPAddr))
 			})
 			checkACKs(t, pkts, remote)
 		})
@@ -70,8 +72,8 @@ func TestDialTCP(t *testing.T) {
 	})
 	t.Run("generic ip", func(t *testing.T) {
 		t.Parallel()
-		pkts, remote := testDialAndCapture(t, "tcp", func(addr net.Addr) (Conn, error) {
-			return DialTCP("tcp", nil, addr.(*net.TCPAddr))
+		pkts, remote := testDialAndCapture(t, "tcp", func(addr net.Addr) (probednet.Conn, error) {
+			return probednet.DialTCP("tcp", nil, addr.(*net.TCPAddr))
 		})
 		checkACKs(t, pkts, remote)
 	})
@@ -83,23 +85,23 @@ func TestDialUDP(t *testing.T) {
 	doTests := func(t *testing.T, network string, localhost0 net.UDPAddr) {
 		t.Run("nil address", func(t *testing.T) {
 			t.Parallel()
-			testDialAndCapture(t, network, func(addr net.Addr) (Conn, error) {
-				return DialUDP(network, nil, addr.(*net.UDPAddr))
+			testDialAndCapture(t, network, func(addr net.Addr) (probednet.Conn, error) {
+				return probednet.DialUDP(network, nil, addr.(*net.UDPAddr))
 			})
 		})
 		t.Run("wildcard port", func(t *testing.T) {
 			t.Parallel()
-			testDialAndCapture(t, network, func(addr net.Addr) (Conn, error) {
-				return DialUDP(network, &localhost0, addr.(*net.UDPAddr))
+			testDialAndCapture(t, network, func(addr net.Addr) (probednet.Conn, error) {
+				return probednet.DialUDP(network, &localhost0, addr.(*net.UDPAddr))
 			})
 		})
 		t.Run("set port", func(t *testing.T) {
 			t.Parallel()
-			testDialAndCapture(t, network, func(addr net.Addr) (Conn, error) {
+			testDialAndCapture(t, network, func(addr net.Addr) (probednet.Conn, error) {
 				listenConn, err := net.ListenUDP(network, &localhost0)
 				require.NoError(t, err)
 				listenConn.Close()
-				return DialUDP(network, listenConn.LocalAddr().(*net.UDPAddr), addr.(*net.UDPAddr))
+				return probednet.DialUDP(network, listenConn.LocalAddr().(*net.UDPAddr), addr.(*net.UDPAddr))
 			})
 		})
 	}
@@ -114,15 +116,15 @@ func TestDialUDP(t *testing.T) {
 	})
 	t.Run("generic ip", func(t *testing.T) {
 		t.Parallel()
-		testDialAndCapture(t, "udp", func(addr net.Addr) (Conn, error) {
-			return DialUDP("udp", nil, addr.(*net.UDPAddr))
+		testDialAndCapture(t, "udp", func(addr net.Addr) (probednet.Conn, error) {
+			return probednet.DialUDP("udp", nil, addr.(*net.UDPAddr))
 		})
 	})
 }
 
-type dialFunc func(net.Addr) (Conn, error)
+type dialFunc func(net.Addr) (probednet.Conn, error)
 
-func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decodedPacket, remote net.Addr) {
+func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []pktutil.TransportPacket, remote net.Addr) {
 	t.Helper()
 
 	const (
@@ -193,17 +195,17 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 	conn.Close()
 	<-captureComplete
 
-	decodedPackets := []decodedPacket{}
+	decodedPackets := []pktutil.TransportPacket{}
 	sawClientMsg, sawServerMsg := false, false
 	for _, raw := range packets {
-		pkt, err := decodePacket(raw)
+		pkt, err := pktutil.DecodeTransportPacket(raw, loopbackLayerType())
 		require.NoError(t, err)
-		if assert.True(t, pkt.partOf(conn), "received stray packet") {
+		if assert.True(t, pkt.PartOf(conn), "received stray packet") {
 			decodedPackets = append(decodedPackets, *pkt)
-			if pkt.destinedFor(conn.RemoteAddr()) {
-				sawClientMsg = sawClientMsg || bytes.Equal(pkt.payload, []byte(clientMsg))
+			if pkt.DestinedFor(conn.RemoteAddr()) {
+				sawClientMsg = sawClientMsg || bytes.Equal(pkt.Payload, []byte(clientMsg))
 			} else {
-				sawServerMsg = sawServerMsg || bytes.Equal(pkt.payload, []byte(serverMsg))
+				sawServerMsg = sawServerMsg || bytes.Equal(pkt.Payload, []byte(serverMsg))
 			}
 		}
 	}
@@ -214,27 +216,27 @@ func testDialAndCapture(t *testing.T, network string, dial dialFunc) (_ []decode
 }
 
 // Assumes all packets are TCP packets and part of the same connection.
-func checkACKs(t *testing.T, packets []decodedPacket, remote net.Addr) {
+func checkACKs(t *testing.T, packets []pktutil.TransportPacket, remote net.Addr) {
 	t.Helper()
 
 	inboundACKs, outboundACKs := uint32Set{}, uint32Set{}
 	for _, pkt := range packets {
-		if pkt.destinedFor(remote) {
-			outboundACKs.add(pkt.tcpLayer.Ack)
+		if pkt.DestinedFor(remote) {
+			outboundACKs.add(pkt.TCPLayer.Ack)
 		} else {
-			inboundACKs.add(pkt.tcpLayer.Ack)
+			inboundACKs.add(pkt.TCPLayer.Ack)
 		}
 	}
 
 	for _, pkt := range packets {
-		if pkt.destinedFor(remote) {
+		if pkt.DestinedFor(remote) {
 			assert.True(
-				t, inboundACKs.contains(pkt.expectedACK()),
-				"expected to see ACK %d from server; actually seen: %v", pkt.expectedACK(), inboundACKs.keys())
+				t, inboundACKs.contains(pkt.ExpectedACK()),
+				"expected to see ACK %d from server; actually seen: %v", pkt.ExpectedACK(), inboundACKs.keys())
 		} else {
 			assert.True(
-				t, outboundACKs.contains(pkt.expectedACK()),
-				"expected to see ACK %d from client; actually seen: %v", pkt.expectedACK(), outboundACKs.keys())
+				t, outboundACKs.contains(pkt.ExpectedACK()),
+				"expected to see ACK %d from client; actually seen: %v", pkt.ExpectedACK(), outboundACKs.keys())
 		}
 	}
 }
@@ -371,132 +373,12 @@ func (s testUDPServer) Addr() net.Addr {
 	return s.LocalAddr()
 }
 
-type decodedPacket struct {
-	ipLayer struct {
-		srcIP, dstIP net.IP
-	}
-	tcpLayer *layers.TCP
-	udpLayer *layers.UDP
-	payload  gopacket.Payload
-}
-
-// Decodes a link-layer packet.
-func decodePacket(linkPacket []byte) (*decodedPacket, error) {
-	var (
-		ip4     layers.IPv4
-		ip6     layers.IPv6
-		tcp     layers.TCP
-		udp     layers.UDP
-		decoded decodedPacket
-
-		linkLayerType gopacket.LayerType
-		linkLayer     gopacket.DecodingLayer
-
-		decodedLayerTypes = []gopacket.LayerType{}
-	)
-
+func loopbackLayerType() gopacket.LayerType {
 	switch runtime.GOOS {
 	case "linux":
-		linkLayerType = layers.LayerTypeEthernet
-		linkLayer = &layers.Ethernet{}
+		return layers.LayerTypeEthernet
 	default:
-		linkLayerType = layers.LayerTypeLoopback
-		linkLayer = &layers.Loopback{}
-	}
-
-	parser := gopacket.NewDecodingLayerParser(
-		linkLayerType,
-		linkLayer,
-		&ip4,
-		&ip6,
-		&tcp,
-		&udp,
-		&decoded.payload,
-	)
-	if err := parser.DecodeLayers(linkPacket, &decodedLayerTypes); err != nil {
-		return nil, err
-	}
-	for _, layerType := range decodedLayerTypes {
-		switch layerType {
-		case layers.LayerTypeIPv4:
-			decoded.ipLayer.srcIP, decoded.ipLayer.dstIP = ip4.SrcIP, ip4.DstIP
-		case layers.LayerTypeIPv6:
-			decoded.ipLayer.srcIP, decoded.ipLayer.dstIP = ip6.SrcIP, ip6.DstIP
-		case layers.LayerTypeTCP:
-			decoded.tcpLayer = &tcp
-		case layers.LayerTypeUDP:
-			decoded.udpLayer = &udp
-		}
-	}
-	return &decoded, nil
-}
-
-func (p decodedPacket) expectedACK() uint32 {
-	if p.tcpLayer == nil {
-		return 0
-	}
-	if p.tcpLayer.SYN {
-		return p.tcpLayer.Seq + 1
-	}
-	return p.tcpLayer.Seq + uint32(len(p.payload))
-}
-
-// True iff this is a packet routed between conn.LocalAddr() and conn.RemoteAddr().
-func (p decodedPacket) partOf(conn Conn) bool {
-	switch conn := conn.(type) {
-	case *TCPConn:
-		return p.partOfTCP(conn)
-	case *UDPConn:
-		return p.partOfUDP(conn)
-	default:
-		panic("unexpected connection type")
-	}
-}
-
-func (p decodedPacket) partOfTCP(conn *TCPConn) bool {
-	if p.tcpLayer == nil {
-		return false
-	}
-
-	correctSrcAndDst := func(src, dst *net.TCPAddr) bool {
-		return bytes.Equal(p.ipLayer.srcIP, src.IP) &&
-			bytes.Equal(p.ipLayer.dstIP, dst.IP) &&
-			int(p.tcpLayer.SrcPort) == src.Port &&
-			int(p.tcpLayer.DstPort) == dst.Port
-	}
-	laddr, raddr := conn.LocalAddr().(*net.TCPAddr), conn.RemoteAddr().(*net.TCPAddr)
-	return correctSrcAndDst(laddr, raddr) || correctSrcAndDst(raddr, laddr)
-}
-
-func (p decodedPacket) partOfUDP(conn *UDPConn) bool {
-	if p.udpLayer == nil {
-		return false
-	}
-
-	correctSrcAndDst := func(src, dst *net.UDPAddr) bool {
-		return bytes.Equal(p.ipLayer.srcIP, src.IP) &&
-			bytes.Equal(p.ipLayer.dstIP, dst.IP) &&
-			int(p.udpLayer.SrcPort) == src.Port &&
-			int(p.udpLayer.DstPort) == dst.Port
-	}
-	laddr, raddr := conn.LocalAddr().(*net.UDPAddr), conn.RemoteAddr().(*net.UDPAddr)
-	return correctSrcAndDst(laddr, raddr) || correctSrcAndDst(raddr, laddr)
-}
-
-func (p decodedPacket) destinedFor(addr net.Addr) bool {
-	switch addr := addr.(type) {
-	case *net.TCPAddr:
-		if p.tcpLayer == nil {
-			return false
-		}
-		return bytes.Equal(p.ipLayer.dstIP, addr.IP) && int(p.tcpLayer.DstPort) == addr.Port
-	case *net.UDPAddr:
-		if p.udpLayer == nil {
-			return false
-		}
-		return bytes.Equal(p.ipLayer.dstIP, addr.IP) && int(p.udpLayer.DstPort) == addr.Port
-	default:
-		panic("unrecognized address type")
+		return layers.LayerTypeLoopback
 	}
 }
 
