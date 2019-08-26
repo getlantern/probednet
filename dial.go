@@ -12,8 +12,6 @@ package probednet
 import (
 	"fmt"
 	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -141,7 +139,9 @@ func newHandleReader(laddr net.Addr) (*handleReader, error) {
 		return nil, errors.New("failed to obtain interface for connection's local address: %v", err)
 	}
 
-	handle, err := pcap.OpenLive(iface.Name, int32(iface.MTU), false, packetReadTimeout)
+	// TODO: figure out appropriate MTU for interface
+	mtu := int32(1500)
+	handle, err := pcap.OpenLive(iface.Name, mtu, false, packetReadTimeout)
 	if err != nil {
 		return nil, errors.New("failed to open pcap handle: %v", err)
 	}
@@ -350,23 +350,15 @@ func preferredOutboundIP(remoteIP net.IP) (net.IP, error) {
 	return conn.LocalAddr().(*net.UDPAddr).IP, nil
 }
 
-func getInterface(ip net.IP) (*net.Interface, error) {
-	ifaces, err := net.Interfaces()
+func getInterface(ip net.IP) (*pcap.Interface, error) {
+	ifaces, err := pcap.FindAllDevs()
 	if err != nil {
 		return nil, errors.New("failed to obtain system interfaces: %v", err)
 	}
 
 	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			return nil, errors.New("failed to obtain addresses for %s: %v", iface.Name, err)
-		}
-		for _, addr := range addrs {
-			ipNet, err := parseNetwork(addr.String())
-			if err != nil {
-				return nil, errors.New("failed to parse interface address %s as IP network: %v", addr.String(), err)
-			}
-			if ipNet.Contains(ip) {
+		for _, addr := range iface.Addresses {
+			if getIPNet(addr).Contains(ip) {
 				return &iface, nil
 			}
 		}
@@ -374,38 +366,15 @@ func getInterface(ip net.IP) (*net.Interface, error) {
 	return nil, errors.New("no network interface for %v", ip)
 }
 
-// Parses a network of addresses like 127.0.0.1/8. Inputs like 127.0.0.1 are valid and will be
-// interpreted as equivalent to 127.0.0.1/0.
-func parseNetwork(addr string) (*net.IPNet, error) {
-	splits := strings.Split(addr, "/")
-
-	var (
-		ip       net.IP
-		maskOnes int
-		err      error
-	)
-	switch len(splits) {
-	case 1:
-		ip = net.ParseIP(addr)
-		maskOnes = 0
-	case 2:
-		ip = net.ParseIP(splits[0])
-		maskOnes, err = strconv.Atoi(splits[1])
-		if err != nil {
-			return nil, errors.New("expected integer after '/' character, found %s", splits[1])
-		}
-	default:
-		return nil, errors.New("expected one or zero '/' characters in address, found %d", len(splits))
+func getIPNet(addr pcap.InterfaceAddress) *net.IPNet {
+	ipNet := net.IPNet{IP: addr.IP, Mask: addr.Netmask}
+	if ipNet.Mask != nil {
+		return &ipNet
 	}
-
-	if ip == nil {
-		return nil, errors.New("failed to parse network number as IP address")
-	}
-	var mask net.IPMask
-	if ip.To4() != nil {
-		mask = net.CIDRMask(maskOnes, 32)
+	if ipNet.IP.To4() != nil {
+		ipNet.Mask = net.CIDRMask(0, 32)
 	} else {
-		mask = net.CIDRMask(maskOnes, 128)
+		ipNet.Mask = net.CIDRMask(0, 128)
 	}
-	return &net.IPNet{IP: ip, Mask: mask}, nil
+	return &ipNet
 }
