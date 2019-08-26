@@ -19,6 +19,8 @@ import (
 	"github.com/getlantern/probednet/pktutil"
 )
 
+// TODO: fix tests; the utilty in testing/main.go works on Windows, but these tests do not
+
 func TestTypes(t *testing.T) {
 	var (
 		tcpConn *probednet.TCPConn
