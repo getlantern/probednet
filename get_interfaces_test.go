@@ -15,6 +15,12 @@ func TestInterfaces(t *testing.T) {
 	require.NoError(t, err)
 	for _, iface := range netIfaces {
 		fmt.Printf("\t%+v\n", iface)
+		addrs, err := iface.Addrs()
+		require.NoError(t, err)
+		fmt.Printf("\t\taddresses:%v\n", addrs)
+		mcAddrs, err := iface.MulticastAddrs()
+		require.NoError(t, err)
+		fmt.Printf("\t\tmulticast addresses:%v\n", mcAddrs)
 	}
 
 	fmt.Println("\npcap.FindAllDevs():")
