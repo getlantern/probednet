@@ -17,10 +17,19 @@ func TestInterfaces(t *testing.T) {
 		fmt.Printf("\t%+v\n", iface)
 		addrs, err := iface.Addrs()
 		require.NoError(t, err)
-		fmt.Printf("\t\taddresses:%v\n", addrs)
-		mcAddrs, err := iface.MulticastAddrs()
-		require.NoError(t, err)
-		fmt.Printf("\t\tmulticast addresses:%v\n", mcAddrs)
+		fmt.Println("\t\taddresses:")
+		for _, addr := range addrs {
+			fmt.Println("\t\t\t", addr)
+			switch addrT := addr.(type) {
+			case *net.IPAddr:
+				fmt.Println("\t\t\tis loopback:", addrT.IP.IsLoopback())
+			case *net.IPNet:
+				fmt.Println("\t\t\tis loopback:", addrT.IP.IsLoopback())
+			}
+		}
+		// mcAddrs, err := iface.MulticastAddrs()
+		// require.NoError(t, err)
+		// fmt.Printf("\t\tmulticast addresses:%v\n", mcAddrs)
 	}
 
 	fmt.Println("\npcap.FindAllDevs():")
@@ -28,5 +37,10 @@ func TestInterfaces(t *testing.T) {
 	require.NoError(t, err)
 	for _, iface := range pcapIfaces {
 		fmt.Printf("\t%+v\n", iface)
+		fmt.Println("\t\taddresses:")
+		for _, addr := range iface.Addresses {
+			fmt.Println("\t\t\t", addr)
+			fmt.Println("\t\t\tis loopback:", addr.IP.IsLoopback())
+		}
 	}
 }
