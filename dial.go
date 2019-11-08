@@ -79,7 +79,7 @@ type genericConn struct {
 func (c *genericConn) Close() error {
 	// Close the handle reader after closing the connection to ensure we capture the final packets.
 	defer c.handleReader.Close()
-	return c.Close()
+	return c.Conn.Close()
 }
 
 // TCPConn - like net.TCPConn - is the implementation of the Conn interface for TCP network
