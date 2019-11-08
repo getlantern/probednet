@@ -10,6 +10,7 @@
 package probednet
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -67,6 +68,18 @@ type Conn interface {
 
 	// CaptureComplete can be used to stop packet capture. The connection itself is unaffected.
 	CaptureComplete()
+}
+
+type genericConn struct {
+	net.Conn
+	*handleReader
+}
+
+// Close the connection
+func (c *genericConn) Close() error {
+	// Close the handle reader after closing the connection to ensure we capture the final packets.
+	defer c.handleReader.Close()
+	return c.Close()
 }
 
 // TCPConn - like net.TCPConn - is the implementation of the Conn interface for TCP network
@@ -226,76 +239,128 @@ func (c *handleReader) CaptureComplete() {
 //
 // Supported networks are "tcp", "tcp4", "tcp6", "udp", "udp4", and "udp6".
 func Dial(network, address string) (Conn, error) {
-	switch network {
-	case "tcp", "tcp4", "tcp6":
-		raddr, err := net.ResolveTCPAddr(network, address)
-		if err != nil {
-			return nil, errors.New("failed to resolve address: %v", err)
-		}
-		return DialTCP(network, nil, raddr)
-	case "udp", "udp4", "udp6":
-		raddr, err := net.ResolveUDPAddr(network, address)
-		if err != nil {
-			return nil, errors.New("failed to resolve address: %v", err)
-		}
-		return DialUDP(network, nil, raddr)
-	default:
-		return nil, errors.New("unsupported network")
-	}
+	return DialWith(net.Dialer{}, network, address)
+}
+
+// DialTimeout behaves like net.DialTimeout, but attaches a probe to the connection.
+//
+// Supported networks are "tcp", "tcp4", "tcp6", "udp", "udp4", and "udp6".
+func DialTimeout(network, address string, timeout time.Duration) (Conn, error) {
+	return DialWith(net.Dialer{Timeout: timeout}, network, address)
 }
 
 // DialTCP behaves like net.DialTCP, but attaches a probe to the connection.
 func DialTCP(network string, laddr, raddr *net.TCPAddr) (*TCPConn, error) {
-	deferred := new(deferStack)
-	defer deferred.call()
-
-	laddr, freeLaddr, err := chooseLaddrTCP(network, laddr, raddr)
-	if err != nil {
-		return nil, errors.New("failed to set local address: %v", err)
-	}
-	deferred.push(func() { freeLaddr() })
-
-	hr, err := newHandleReader(laddr)
-	if err != nil {
-		return nil, errors.New("failed to open capture handle: %v", err)
-	}
-	deferred.push(hr.Close)
-	if err := freeLaddr(); err != nil {
-		return nil, errors.New("unable to free local address for use: %v", err)
-	}
-	netConn, err := net.DialTCP(network, laddr, raddr)
+	netConn, hr, err := dialWith(net.Dialer{LocalAddr: laddr}, network, raddr.String())
 	if err != nil {
 		return nil, err
 	}
-	deferred.cancel()
-	return &TCPConn{netConn, hr}, nil
+	return &TCPConn{netConn.(*net.TCPConn), hr}, nil
 }
 
 // DialUDP behaves like net.DialUDP, but attaches a probe to the connection.
 func DialUDP(network string, laddr, raddr *net.UDPAddr) (*UDPConn, error) {
-	deferred := new(deferStack)
-	defer deferred.call()
-
-	laddr, freeLaddr, err := chooseLaddrUDP(network, laddr, raddr)
-	if err != nil {
-		return nil, errors.New("failed to set local address: %v", err)
-	}
-	deferred.push(func() { freeLaddr() })
-
-	hr, err := newHandleReader(laddr)
-	if err != nil {
-		return nil, errors.New("failed to open capture handle: %v", err)
-	}
-	deferred.push(hr.Close)
-	if err := freeLaddr(); err != nil {
-		return nil, errors.New("unable to free local address for use: %v", err)
-	}
-	netConn, err := net.DialUDP(network, laddr, raddr)
+	netConn, hr, err := dialWith(net.Dialer{LocalAddr: laddr}, network, raddr.String())
 	if err != nil {
 		return nil, err
 	}
+	return &UDPConn{netConn.(*net.UDPConn), hr}, nil
+}
+
+// DialWith behaves like d.Dial, but attaches a probe to the connection.
+//
+// Supported networks are "tcp", "tcp4", "tcp6", "udp", "udp4", and "udp6".
+func DialWith(d net.Dialer, network, address string) (Conn, error) {
+	netConn, hr, err := dialWith(d, network, address)
+	if err != nil {
+		return nil, err
+	}
+	return &genericConn{netConn, hr}, nil
+}
+
+// DialContextWith behaves like d.DialContext, but attaches a probe to the connection.
+//
+// Supported networks are "tcp", "tcp4", "tcp6", "udp", "udp4", and "udp6".
+func DialContextWith(ctx context.Context, d net.Dialer, network, address string) (Conn, error) {
+	netConn, hr, err := dialContextWith(ctx, d, network, address)
+	if err != nil {
+		return nil, err
+	}
+	return &genericConn{netConn, hr}, nil
+}
+
+func dialWith(d net.Dialer, network, address string) (net.Conn, *handleReader, error) {
+	return dialContextWith(context.Background(), d, network, address)
+}
+
+func dialContextWith(ctx context.Context, d net.Dialer, network, address string) (net.Conn, *handleReader, error) {
+	deferred := new(deferStack)
+	defer deferred.call()
+
+	var (
+		raddr, laddr net.Addr
+		freeLaddr    func() error
+		err          error
+	)
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		var laddrTCP *net.TCPAddr
+		var ok bool
+		if d.LocalAddr != nil {
+			laddrTCP, ok = d.LocalAddr.(*net.TCPAddr)
+			if !ok {
+				return nil, nil, errors.New("local address must be a *net.TCPAddr")
+			}
+		}
+		raddr, err = net.ResolveTCPAddr(network, address)
+		if err != nil {
+			return nil, nil, errors.New("failed to resolve address: %v", err)
+		}
+		laddr, freeLaddr, err = chooseLaddrTCP(network, laddrTCP, raddr.(*net.TCPAddr))
+		if err != nil {
+			return nil, nil, errors.New("failed to set local address: %v", err)
+		}
+		deferred.push(func() { freeLaddr() })
+
+	case "udp", "udp4", "udp6":
+		var laddrUDP *net.UDPAddr
+		var ok bool
+		if d.LocalAddr != nil {
+			laddrUDP, ok = d.LocalAddr.(*net.UDPAddr)
+			if !ok {
+				return nil, nil, errors.New("local address must be a *net.UDPAddr")
+			}
+		}
+		raddr, err = net.ResolveUDPAddr(network, address)
+		if err != nil {
+			return nil, nil, errors.New("failed to resolve address: %v", err)
+		}
+		laddr, freeLaddr, err = chooseLaddrUDP(network, laddrUDP, raddr.(*net.UDPAddr))
+		if err != nil {
+			return nil, nil, errors.New("failed to set local address: %v", err)
+		}
+		deferred.push(func() { freeLaddr() })
+
+	default:
+		return nil, nil, errors.New("unsupported network")
+	}
+
+	hr, err := newHandleReader(laddr)
+	if err != nil {
+		return nil, nil, errors.New("failed to open capture handle: %v", err)
+	}
+	deferred.push(hr.Close)
+
+	if err := freeLaddr(); err != nil {
+		return nil, nil, errors.New("unable to free local address for use: %v", err)
+	}
+	d.LocalAddr = laddr
+	netConn, err := d.DialContext(ctx, network, raddr.String())
+	if err != nil {
+		return nil, nil, err
+	}
 	deferred.cancel()
-	return &UDPConn{netConn, hr}, nil
+	return netConn, hr, nil
 }
 
 // Chooses a local address based on the network and remote address. Any fields set on the input
